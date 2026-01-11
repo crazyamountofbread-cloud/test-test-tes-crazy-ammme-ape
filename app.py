@@ -173,6 +173,25 @@ def ff_escape_text(s: str) -> str:
 
 from dataclasses import dataclass
 from PIL import ImageFont
+
+# ---- Font helpers (Pillow on some Linux builds can't load variable fonts) ----
+def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
+    """Return first font path that exists and Pillow can load."""
+    for p in candidates:
+        if not p:
+            continue
+        p = p.strip()
+        if not p:
+            continue
+        if os.path.exists(p):
+            try:
+                ImageFont.truetype(p, test_size)
+                return p
+            except Exception:
+                continue
+    raise RuntimeError(
+        "No usable TTF font found. Provide a static .ttf via FONTFILE env or include one in ./fonts."
+    )
 import numpy as np
 import cv2
 
@@ -360,10 +379,16 @@ def render_binary():
     app.logger.info(f"[render_binary] id={vid_id} caption_len={len(caption)}")
     app.logger.info(f"[render_binary] files_keys={list(request.files.keys())}")
 
-    fontfile = os.environ.get(
-        "FONTFILE",
-        "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf"
-    )
+    # Font: try user-provided FONTFILE first, then common repo paths, then system fonts.
+    font_candidates = [
+        os.environ.get("FONTFILE", "").strip(),
+        "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
+        "./GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    fontfile = resolve_font_path(font_candidates)
+
     logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
 
     if not os.path.exists(fontfile):
