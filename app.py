@@ -7,6 +7,25 @@ import unicodedata
 import tempfile
 import subprocess
 import urllib.request
+import base64
+
+COOKIES_PATH = "/tmp/ig_cookies.txt"
+
+def ensure_ig_cookies():
+    b64 = os.environ.get("IG_COOKIES_B64", "").strip()
+    if not b64:
+        return None
+
+    if os.path.exists(COOKIES_PATH):
+        return COOKIES_PATH
+
+    try:
+        raw = base64.b64decode(b64.encode("utf-8"))
+        with open(COOKIES_PATH, "wb") as f:
+            f.write(raw)
+        return COOKIES_PATH
+    except Exception:
+        return None
 
 app = Flask(__name__)
 @app.get("/")
@@ -32,11 +51,23 @@ def get_direct():
         return jsonify({"error": "missing url"}), 400
 
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "format": "best",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "format": "best",
+    "retries": 3,
+    "fragment_retries": 3,
+    "sleep_interval": 2,
+    "max_sleep_interval": 6,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0"
+    },
     }
+
+    cookies = ensure_ig_cookies()
+    if cookies:
+        ydl_opts["cookiefile"] = cookies
+
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
