@@ -3,17 +3,17 @@ const { spawn } = require("child_process");
 
 const app = express();
 
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Leve: retorna URL direto do vídeo (sem baixar no Render)
 app.get("/get", (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "missing url" });
 
-  // chama yt-dlp como módulo python: python3 -m yt_dlp ...
-  const p = spawn("python3", ["-m", "yt_dlp", "-g", "--no-playlist", url]);
+  // executa o yt-dlp instalado no user bin
+  const cmd = "yt-dlp";
+  const args = ["-g", "--no-playlist", url];
+
+  const p = spawn(cmd, args);
 
   let stdout = "";
   let stderr = "";
@@ -23,7 +23,7 @@ app.get("/get", (req, res) => {
 
   p.on("error", (err) => {
     return res.status(500).json({
-      error: "python spawn error",
+      error: "spawn error",
       details: String(err),
     });
   });
@@ -41,9 +41,7 @@ app.get("/get", (req, res) => {
       .map((l) => l.trim())
       .filter(Boolean);
 
-    if (!lines.length) {
-      return res.status(500).json({ error: "no direct url returned" });
-    }
+    if (!lines.length) return res.status(500).json({ error: "no direct url returned" });
 
     res.json({ directUrl: lines[0], allUrls: lines });
   });
