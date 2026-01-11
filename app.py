@@ -1,12 +1,8 @@
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
-import os
-import re
-import textwrap
-import unicodedata
-import tempfile
-import subprocess
 import urllib.request
+
+import os, tempfile, subprocess, re, textwrap, unicodedata
 
 app = Flask(__name__)
 
@@ -257,6 +253,129 @@ def render():
         except:
             pass
 
+@app.post("/render_binary")
+def render_binary():
+    """
+    multipart/form-data:
+      - file: video/mp4 (binary)
+      - caption: string
+      - id: string/int
+    returns: mp4 binary (idF.mp4)
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "missing file"}), 400
+
+    f = request.files["file"]
+    caption = request.form.get("caption", "")
+    vid_id = str(request.form.get("id", "video"))
+
+    fontfile = os.environ.get("FONTFILE", "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf")
+    logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
+
+    if not os.path.exists(logo_path):
+        return jsonify({"error": "missing Logo.png on server", "path": logo_path}), 500
+    if not os.path.exists(fontfile):
+        return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
+
+    # ---- helpers (iguais aos que você já tem) ----
+    def sanitize_caption(s: str) -> str:
+        s = s.replace("\r", "").lstrip("\ufeff")
+        s = unicodedata.normalize("NFKC", s)
+        out = []
+        for ch in s:
+            cat = unicodedata.category(ch)
+            if cat[0] == "C":  # invisíveis
+                continue
+            if cat == "So":    # emojis (você decidiu ignorar)
+                continue
+            out.append(ch)
+        s = "".join(out)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def make_caption_lines(caption: str, width: int = 28, max_lines: int = 2):
+        s = sanitize_caption(caption)
+        lines = textwrap.wrap(s, width=width, break_long_words=False, break_on_hyphens=False)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            last = lines[-1]
+            if len(last) >= width:
+                last = last[: max(0, width - 1)].rstrip()
+            lines[-1] = last.rstrip() + "…"
+        line1 = lines[0] if len(lines) > 0 else ""
+        line2 = lines[1] if len(lines) > 1 else ""
+        return line1, line2
+
+    def ff_escape_text(s: str) -> str:
+        s = s.replace("\\", "\\\\")
+        s = s.replace(":", r"\:")
+        s = s.replace("'", r"\'")
+        s = s.replace("%", r"\%")
+        return s
+
+    line1, line2 = make_caption_lines(caption, width=28, max_lines=2)
+    font_ff = fontfile.replace(",", r"\,").replace(":", r"\:")
+
+    filter_complex = (
+        "[0:v]"
+        "scale=1280:720:force_original_aspect_ratio=increase,"
+        "crop=1280:720,"
+        "scale=1080:-1,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+        "[base];"
+        "[1:v]scale=220:-1[logo];"
+        "[base][logo]overlay=x=(W-w)/2:y=H*0.04[withlogo];"
+        "[withlogo]"
+        f"drawtext=text='{ff_escape_text(line1)}':fontfile={font_ff}:"
+        "fontsize=56:fontcolor=white:borderw=3:bordercolor=black@0.90:"
+        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
+        "x=(w-text_w)/2:y=h*0.25-36,"
+        f"drawtext=text='{ff_escape_text(line2)}':fontfile={font_ff}:"
+        "fontsize=56:fontcolor=white:borderw=3:bordercolor=black@0.90:"
+        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
+        "x=(w-text_w)/2:y=h*0.25+36,"
+        "drawtext=text='Siga @SuperEmAlta':"
+        f"fontfile={font_ff}:"
+        "fontsize=38:fontcolor=white:borderw=3:bordercolor=black@0.90:"
+        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
+        "x=(w-text_w)/2:y=h*0.70"
+        "[vout]"
+    )
+
+    tmp_dir = tempfile.mkdtemp(prefix="render_")
+    in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
+    out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
+
+    try:
+        f.save(in_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-i", logo_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            out_path
+        ]
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if r.returncode != 0 or not os.path.exists(out_path):
+            return jsonify({"error": "render failed", "details": (r.stderr or "")[-2000:]}), 500
+
+        return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name=f"{vid_id}F.mp4")
+
+    finally:
+        try:
+            for fn in os.listdir(tmp_dir):
+                try: os.remove(os.path.join(tmp_dir, fn))
+                except: pass
+            os.rmdir(tmp_dir)
+        except:
+            pass
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
