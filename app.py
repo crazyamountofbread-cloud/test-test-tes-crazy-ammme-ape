@@ -8,6 +8,7 @@ import tempfile
 import subprocess
 import urllib.request
 import base64
+import json
 
 COOKIES_PATH = "/tmp/ig_cookies.txt"
 
@@ -167,6 +168,175 @@ def ff_escape_text(s: str) -> str:
 
 
 # ======================================================
+# Helpers (new crop + auto-fit)
+# ======================================================
+
+from dataclasses import dataclass
+from PIL import ImageFont
+import numpy as np
+import cv2
+
+@dataclass
+class BBox:
+    x: int
+    y: int
+    w: int
+    h: int
+
+def ffprobe_dims(path: str):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", path
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr)
+    data = json.loads(p.stdout)
+    st = data["streams"][0]
+    return int(st["width"]), int(st["height"])
+
+def extract_frame(in_video: str, out_png: str, t: float) -> bool:
+    cmd = ["ffmpeg", "-y", "-ss", str(t), "-i", in_video, "-vframes", "1", "-q:v", "2", out_png]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0 and os.path.exists(out_png)
+
+def detect_bg_color(img_bgr: np.ndarray):
+    h, w = img_bgr.shape[:2]
+    band = max(8, h // 50)
+    top = img_bgr[:band, :, :]
+    bot = img_bgr[h-band:, :, :]
+
+    b = np.concatenate([top[...,0].astype(np.float32), bot[...,0].astype(np.float32)], axis=0)
+    g = np.concatenate([top[...,1].astype(np.float32), bot[...,1].astype(np.float32)], axis=0)
+    r = np.concatenate([top[...,2].astype(np.float32), bot[...,2].astype(np.float32)], axis=0)
+    luma = 0.114*b + 0.587*g + 0.299*r
+    m = float(np.mean(luma))
+    return (255,255,255) if m >= 128 else (0,0,0)
+
+def smooth1d(x: np.ndarray, k: int) -> np.ndarray:
+    k = max(5, k | 1)
+    kernel = np.ones(k, dtype=np.float32) / k
+    return np.convolve(x, kernel, mode="same")
+
+def largest_contiguous_segment(idx: np.ndarray):
+    if idx.size == 0:
+        return None
+    d = np.diff(idx)
+    breaks = np.where(d > 1)[0]
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends   = np.r_[idx[breaks], idx[-1]]
+    lengths = ends - starts + 1
+    j = int(np.argmax(lengths))
+    return int(starts[j]), int(ends[j])
+
+def build_content_mask(img_bgr: np.ndarray, tol: int) -> np.ndarray:
+    bg = np.array(detect_bg_color(img_bgr), dtype=np.int16)
+    img16 = img_bgr.astype(np.int16)
+    diff = np.max(np.abs(img16 - bg[None, None, :]), axis=2)
+    content = (diff > tol).astype(np.uint8)
+
+    h, w = img_bgr.shape[:2]
+    k = max(3, (min(h, w) // 280) | 1)
+    kernel = np.ones((k, k), np.uint8)
+    content = cv2.morphologyEx(content, cv2.MORPH_OPEN, kernel, iterations=1)
+    content = cv2.morphologyEx(content, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return content
+
+def find_bbox_ignore_overlay(img_bgr: np.ndarray, tol: int = 28, row_thresh: float = 0.08):
+    # y_only: corta só topo/baixo, mantém largura total
+    h, w = img_bgr.shape[:2]
+    content = build_content_mask(img_bgr, tol=tol)
+    row_frac = np.mean(content, axis=1)
+    row_frac_s = smooth1d(row_frac, k=max(11, h // 120))
+    rows = np.where(row_frac_s > row_thresh)[0]
+    seg = largest_contiguous_segment(rows)
+    if seg is None:
+        raise RuntimeError("bbox not found")
+    y1, y2 = seg
+    return BBox(x=0, y=y1, w=w, h=(y2 - y1 + 1))
+
+def median_bbox(bboxes):
+    xs = np.array([b.x for b in bboxes], dtype=np.int32)
+    ys = np.array([b.y for b in bboxes], dtype=np.int32)
+    ws = np.array([b.w for b in bboxes], dtype=np.int32)
+    hs = np.array([b.h for b in bboxes], dtype=np.int32)
+    return BBox(int(np.median(xs)), int(np.median(ys)), int(np.median(ws)), int(np.median(hs)))
+
+def escape_filter_path(p: str) -> str:
+    return p.replace("\\", "\\\\").replace(":", r"\:").replace(",", r"\,")
+
+@dataclass
+class FitResult:
+    font_size: int
+    lines: list
+    text_h: int
+    line_h: int
+    line_ws: list
+
+def wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int):
+    words = text.strip().split()
+    if not words:
+        return [""]
+    def width(s: str) -> int:
+        bb = font.getbbox(s)
+        return bb[2] - bb[0]
+    lines = []
+    cur = words[0]
+    for w in words[1:]:
+        t = cur + " " + w
+        if width(t) <= max_w:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    fixed = []
+    for ln in lines:
+        if width(ln) <= max_w:
+            fixed.append(ln)
+            continue
+        buf = ""
+        for ch in ln:
+            tt = buf + ch
+            if width(tt) <= max_w or not buf:
+                buf = tt
+            else:
+                fixed.append(buf)
+                buf = ch
+        if buf:
+            fixed.append(buf)
+    return fixed
+
+def measure_lines(lines, font: ImageFont.FreeTypeFont, line_spacing: float):
+    b = font.getbbox("Ag")
+    base_line_h = (b[3] - b[1])
+    line_h = int(round(base_line_h * line_spacing))
+    widths = []
+    for ln in lines:
+        bb = font.getbbox(ln)
+        widths.append(bb[2] - bb[0])
+    text_h = line_h * len(lines) - (line_h - base_line_h)
+    return text_h, line_h, widths
+
+def fit_text_top(text: str, font_path: str, max_w: int, max_h: int,
+                 max_font: int = 96, min_font: int = 34,
+                 line_spacing: float = 1.15, max_lines: int = 3):
+    text = sanitize_caption(text)
+    for size in range(max_font, min_font - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text_to_width(text, font, max_w)
+        if len(lines) > max_lines:
+            continue
+        text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+        if text_h <= max_h:
+            return FitResult(size, lines, text_h, line_h, line_ws)
+    font = ImageFont.truetype(font_path, min_font)
+    lines = wrap_text_to_width(text, font, max_w)[:max_lines]
+    text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+    return FitResult(min_font, lines, min(text_h, max_h), line_h, line_ws)
+
+
+# ======================================================
 # /render_binary  (MAIN RENDER ENDPOINT)
 # ======================================================
 @app.post("/render_binary")
@@ -204,48 +374,141 @@ def render_binary():
         app.logger.error(f"[render_binary] logo missing: {logo_path}")
         return jsonify({"error": "missing Logo.png on server", "path": logo_path}), 500
 
-    line1, line2 = make_caption_lines(caption)
-    font_ff = fontfile.replace(",", r"\,").replace(":", r"\:")
-
-    filter_complex = (
-        "[0:v]"
-        "scale=1280:720:force_original_aspect_ratio=increase,"
-        "crop=1280:720,"
-        "scale=1080:-1,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
-        "[base];"
-        "[1:v]scale=220:-1[logo];"
-        "[base][logo]overlay=x=(W-w)/2:y=H*0.04[withlogo];"
-        "[withlogo]"
-        f"drawtext=text='{ff_escape_text(line1)}':fontfile={font_ff}:"
-        "fontsize=56:fontcolor=white:borderw=3:bordercolor=black@0.90:"
-        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
-        "x=(w-text_w)/2:y=h*0.25-36,"
-        f"drawtext=text='{ff_escape_text(line2)}':fontfile={font_ff}:"
-        "fontsize=56:fontcolor=white:borderw=3:bordercolor=black@0.90:"
-        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
-        "x=(w-text_w)/2:y=h*0.25+36,"
-        "drawtext=text='Siga @SuperEmAlta':"
-        f"fontfile={font_ff}:"
-        "fontsize=38:fontcolor=white:borderw=3:bordercolor=black@0.90:"
-        "shadowx=2:shadowy=2:shadowcolor=black@0.35:"
-        "x=(w-text_w)/2:y=h*0.70"
-        "[vout]"
-    )
-
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
 
     try:
+        # save upload
         f.save(in_path)
-        app.logger.info("[render_binary] file saved, running ffmpeg")
+        app.logger.info("[render_binary] file saved, detecting bbox")
 
+        # --- detect bbox (ignore overlay text) using a few frames ---
+        sample_times = [0.5, 1.2, 2.0, 3.0]
+        frames = []
+        for i, t in enumerate(sample_times):
+            fp = os.path.join(tmp_dir, f"___f{i}.png")
+            if extract_frame(in_path, fp, t):
+                frames.append(fp)
+
+        bboxes = []
+        for fp in frames:
+            img = cv2.imread(fp, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            try:
+                bboxes.append(find_bbox_ignore_overlay(img, tol=28, row_thresh=0.08))
+            except Exception:
+                continue
+
+        if not bboxes:
+            # fallback: assume full frame
+            w, h = ffprobe_dims(in_path)
+            bbox = BBox(0, 0, w, h)
+            app.logger.warning("[render_binary] bbox detection failed, using full frame")
+        else:
+            bbox = median_bbox(bboxes)
+
+        src_w, src_h = ffprobe_dims(in_path)
+        # clamp bbox
+        bbox.x = max(0, min(bbox.x, src_w - 1))
+        bbox.y = max(0, min(bbox.y, src_h - 1))
+        bbox.w = max(1, min(bbox.w, src_w - bbox.x))
+        bbox.h = max(1, min(bbox.h, src_h - bbox.y))
+
+        # --- fixed 9:16 canvas ---
+        CANVAS_W, CANVAS_H = 1080, 1920
+
+        # scale cropped to fit canvas
+        scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
+        out_cw = int(round(bbox.w * scale))
+        out_ch = int(round(bbox.h * scale))
+        x0 = (CANVAS_W - out_cw) // 2
+        y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
+
+        # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
+        top_gap = 5
+        space_above = max(10, y0 - top_gap)
+        top_box_w = int(round(CANVAS_W * 0.82))
+        fit = fit_text_top(
+            caption,
+            fontfile,
+            max_w=top_box_w,
+            max_h=space_above,
+            max_font=96,
+            min_font=34,
+            line_spacing=1.15,
+            max_lines=3,
+        )
+        y_block = (y0 - top_gap) - fit.text_h
+        if y_block < 0:
+            y_block = 0
+
+        line_xs = []
+        for lw in fit.line_ws:
+            line_xs.append(max(0, (CANVAS_W - lw) // 2))
+        line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
+
+        # --- LOGO between top edge and top text block ---
+        logo_w, logo_h = ffprobe_dims(logo_path)
+        avail_logo_h = y_block
+        max_logo_w = int(CANVAS_W * 0.35)
+        max_logo_h = int(avail_logo_h * 0.80) if avail_logo_h > 0 else 0
+        logo_scale = 1.0
+        if max_logo_w > 0 and max_logo_h > 0:
+            logo_scale = min(max_logo_w / logo_w, max_logo_h / logo_h, 1.0)
+        logo_out_w = max(1, int(round(logo_w * logo_scale)))
+        logo_out_h = max(1, int(round(logo_h * logo_scale)))
+        x_logo = (CANVAS_W - logo_out_w) // 2
+        y_logo = (y_block - logo_out_h) // 2
+        if y_logo < 0:
+            y_logo = 0
+
+        # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
+        cta_text = "Siga @SuperEmAlta"
+        cta_font_size = 48
+        font_obj = ImageFont.truetype(fontfile, cta_font_size)
+        bb = font_obj.getbbox(cta_text)
+        cta_w = bb[2] - bb[0]
+        cta_h = bb[3] - bb[1]
+        cta_gap = 40
+        y_cta = y0 + out_ch + cta_gap
+        if y_cta + cta_h > CANVAS_H:
+            y_cta = max(0, CANVAS_H - cta_h)
+        x_cta = max(0, (CANVAS_W - cta_w) // 2)
+
+        # --- ffmpeg filter_complex (new motor) ---
+        font_ff = escape_filter_path(fontfile)
+
+        fc = ""
+        fc += f"[0:v]crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},scale={out_cw}:{out_ch}:flags=lanczos,pad={CANVAS_W}:{CANVAS_H}:{x0}:{y0}:black[base];"
+        fc += f"[1:v]scale={logo_out_w}:{logo_out_h}[logo];"
+        fc += f"[base][logo]overlay={x_logo}:{y_logo}[v0];"
+
+        v_in = "v0"
+        for i, ln in enumerate(fit.lines):
+            ln_esc = ff_escape_text(ln)
+            v_out = f"vt{i}"
+            fc += (
+                f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
+                f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
+                f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28[{v_out}];"
+            )
+            v_in = v_out
+
+        cta_esc = ff_escape_text(cta_text)
+        fc += (
+            f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
+            f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
+            f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28[vout]"
+        )
+
+        app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
             "ffmpeg", "-y",
             "-i", in_path,
             "-i", logo_path,
-            "-filter_complex", filter_complex,
+            "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
