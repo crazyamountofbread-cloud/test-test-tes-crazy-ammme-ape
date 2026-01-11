@@ -269,7 +269,7 @@ def render_binary():
     caption = request.form.get("caption", "")
     vid_id = str(request.form.get("id", "video"))
 
-    fontfile = os.environ.get("FONTFILE", "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf")
+    fontfile = os.environ.get("FONTFILE", "./GoogleSans-VariableFont_GRAD,opsz,wght.ttf")
     logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
 
     if not os.path.exists(logo_path):
