@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: superemalta-downloader
+    env: node
+    plan: free
+    buildCommand: |
+      apt-get update
+      apt-get install -y ffmpeg
+      pip install yt-dlp
+      npm install
+    startCommand: npm start
