@@ -6,6 +6,10 @@ services:
     buildCommand: |
       apt-get update
       apt-get install -y python3 python3-pip
-      pip3 install --no-cache-dir yt-dlp
+      python3 -m pip install --upgrade pip
+      python3 -m pip install --user yt-dlp
       npm install
-    startCommand: node server.js
+    startCommand: |
+      export PATH="$HOME/.local/bin:$PATH"
+      export PYTHONPATH="$HOME/.local/lib/python3.*/site-packages:$PYTHONPATH"
+      node server.js
