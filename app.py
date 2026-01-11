@@ -169,7 +169,7 @@ def render():
     if not video_url:
         return jsonify({"error": "missing video_url"}), 400
 
-    fontfile = os.environ.get("FONTFILE", "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf")
+    fontfile = os.environ.get("FONTFILE", "./GoogleSans-VariableFont_GRAD,opsz,wght.ttf")
     logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
 
     if not os.path.exists(logo_path):
