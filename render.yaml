@@ -1,11 +1,13 @@
 services:
   - type: web
-    name: superemalta-downloader
+    name: test-test-tes-crazy-ammme-ape
     env: node
     plan: free
     buildCommand: |
       apt-get update
-      apt-get install -y ffmpeg
-      pip install yt-dlp
+      apt-get install -y python3 python3-pip
+      pip3 install --user yt-dlp
       npm install
-    startCommand: npm start
+    startCommand: |
+      export PATH="$HOME/.local/bin:$PATH"
+      node server.js
