@@ -1,44 +1,71 @@
 const express = require("express");
 const { spawn } = require("child_process");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
 
 const app = express();
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+/**
+ * Health check
+ */
+app.get("/health", (_, res) => {
+  res.json({ ok: true });
+});
 
-app.get("/download-file", (req, res) => {
+/**
+ * Retorna URL direto do vídeo (leve, sem baixar no Render)
+ */
+app.get("/get", (req, res) => {
   const url = req.query.url;
-  if (!url) return res.status(400).send("missing url");
+  if (!url) {
+    return res.status(400).json({ error: "missing url" });
+  }
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "reel-"));
-  const outFile = path.join(tmpDir, "video.mp4");
+  const p = spawn("yt-dlp", ["-g", "--no-playlist", url]);
 
-  const args = [
-    "--no-playlist",
-    "--sleep-interval", "5",
-    "--max-sleep-interval", "12",
-    "--referer", "https://www.instagram.com/",
-    "--user-agent", "Mozilla/5.0",
-    "-f", "bestvideo+bestaudio/best",
-    "--merge-output-format", "mp4",
-    "-o", outFile,
-    url
-  ];
+  let stdout = "";
+  let stderr = "";
 
-  const p = spawn("yt-dlp", args, { stdio: ["ignore", "ignore", "pipe"] });
-  let err = "";
-  p.stderr.on("data", d => err += d.toString());
+  p.stdout.on("data", (d) => {
+    stdout += d.toString();
+  });
+
+  p.stderr.on("data", (d) => {
+    stderr += d.toString();
+  });
+
+  // evita crash se yt-dlp não existir
+  p.on("error", (err) => {
+    return res.status(500).json({
+      error: "yt-dlp spawn error",
+      details: String(err),
+    });
+  });
 
   p.on("close", (code) => {
-    if (code !== 0 || !fs.existsSync(outFile)) {
-      return res.status(500).json({ error: "yt-dlp failed", details: err.slice(-1200) });
+    if (code !== 0) {
+      return res.status(500).json({
+        error: "yt-dlp failed",
+        details: stderr.slice(-1000),
+      });
     }
-    res.setHeader("Content-Type", "video/mp4");
-    fs.createReadStream(outFile).pipe(res);
+
+    const lines = stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      return res.status(500).json({ error: "no video url returned" });
+    }
+
+    // primeira URL normalmente funciona
+    res.json({
+      directUrl: lines[0],
+      allUrls: lines,
+    });
   });
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("running on", PORT));
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
