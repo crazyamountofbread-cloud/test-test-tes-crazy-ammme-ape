@@ -487,7 +487,17 @@ def render_binary():
 
 
         fc = ""
-        fc += f"[0:v]crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},scale={out_cw}:{out_ch}:flags=lanczos,pad={CANVAS_W}:{CANVAS_H}:{x0}:{y0}:black,noise=alls=2:allf=t[base];"
+        fc += (
+            f"[0:v]"
+            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
+            f"scale={out_cw}:{out_ch}:flags=lanczos,"
+            f"setsar=1,setdar=9/16,"
+            f"pad={CANVAS_W}:{CANVAS_H}:{x0j}:{y0j}:black,"
+            f"setsar=1,setdar=9/16,"
+            f"noise=alls=2:allf=t"
+            f"[base];"
+        )
+
         fc += f"[1:v]scale={logo_out_w}:{logo_out_h}[logo];"
         fc += f"[base][logo]overlay={x_logo}:{y_logo}[v0];"
 
@@ -520,12 +530,12 @@ def render_binary():
             "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
-            "-filter:a", f"atempo={atempo},volume=1.02",
-            "-af", "atempo=1.01,volume=1.02",
+            "-af", f"atempo={atempo},volume=1.02",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
             "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
+            "-aspect", "9:16",
             out_path
         ]
 
