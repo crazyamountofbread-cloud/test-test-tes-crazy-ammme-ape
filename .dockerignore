@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.node_modules/
+.cache/
+tmp/
+downloads/
+*.mp4
+*.mov
+*.mkv
+*.zip
+*.tar
+*.gz
