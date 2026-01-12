@@ -8,10 +8,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# força yt-dlp NIGHTLY (instagram quebra o stable o tempo todo)
-RUN python -m pip install --no-cache-dir -U --pre "yt-dlp[default]"
-RUN python -m pip show yt-dlp && yt-dlp --version
-
 # App + assets
 COPY app.py .
 COPY Logo.png .
