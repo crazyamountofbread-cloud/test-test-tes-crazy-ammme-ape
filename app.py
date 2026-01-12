@@ -10,23 +10,8 @@ import urllib.request
 import base64
 import json
 
-COOKIES_PATH = "/tmp/ig_cookies.txt"
+COOKIES_PATH = "/tmp/cookies.txt"
 
-def ensure_ig_cookies():
-    b64 = os.environ.get("IG_COOKIES_B64", "").strip()
-    if not b64:
-        return None
-
-    if os.path.exists(COOKIES_PATH):
-        return COOKIES_PATH
-
-    try:
-        raw = base64.b64decode(b64.encode("utf-8"))
-        with open(COOKIES_PATH, "wb") as f:
-            f.write(raw)
-        return COOKIES_PATH
-    except Exception:
-        return None
 
 app = Flask(__name__)
 @app.get("/")
@@ -67,7 +52,7 @@ def get_direct():
 
     cookies = ensure_ig_cookies()
     if cookies:
-        ydl_opts["cookiefile"] = cookies
+        ydl_opts["cookiefile"] = "cookies.txt"
 
 
     try:
