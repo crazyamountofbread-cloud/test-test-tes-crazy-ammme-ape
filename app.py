@@ -12,6 +12,32 @@ import json
 
 COOKIES_PATH = "/tmp/cookies.txt"
 
+def ensure_ig_cookies() -> str | None:
+    """Ensure cookies.txt is available at /tmp for yt-dlp.
+    Returns cookie path or None."""
+    try:
+        # If already staged in /tmp and has content, use it
+        if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 20:
+            return COOKIES_PATH
+
+        # Prefer repo cookies.txt (same dir as app.py), then CWD
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(here, "cookies.txt"),
+            os.path.join(os.getcwd(), "cookies.txt"),
+            os.environ.get("IG_COOKIES_FILE", "").strip(),
+        ]
+        for p in candidates:
+            if p and os.path.exists(p) and os.path.getsize(p) > 20:
+                # copy to /tmp to avoid read-only paths
+                with open(p, "rb") as src, open(COOKIES_PATH, "wb") as dst:
+                    dst.write(src.read())
+                return COOKIES_PATH
+    except Exception:
+        return None
+    return None
+
+
 
 app = Flask(__name__)
 @app.get("/")
@@ -33,6 +59,13 @@ def health():
 @app.get("/get")
 def get_direct():
     url = request.args.get("url")
+
+    # Simple anti-429 throttle for Instagram
+    if url and ("instagram.com" in url or "instagr.am" in url):
+        import time, random
+        dmin = float(os.environ.get("IG_DELAY_MIN", "30"))
+        dmax = float(os.environ.get("IG_DELAY_MAX", "60"))
+        time.sleep(random.uniform(dmin, dmax))
     if not url:
         return jsonify({"error": "missing url"}), 400
 
@@ -46,13 +79,13 @@ def get_direct():
     "sleep_interval": 2,
     "max_sleep_interval": 6,
     "http_headers": {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
     },
     }
 
     cookies = ensure_ig_cookies()
     if cookies:
-        ydl_opts["cookiefile"] = "cookies.txt"
+        ydl_opts["cookiefile"] = COOKIES_PATH
 
 
     try:
