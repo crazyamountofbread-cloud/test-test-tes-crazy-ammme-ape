@@ -523,8 +523,30 @@ def render_binary():
         # --- ffmpeg filter_complex (new motor) ---
         font_ff = escape_filter_path(fontfile)
 
+        # ======================================================
+        # Anti-fingerprint micro-variations (imperceptible)
+        # ======================================================
+        # Use stable randomness per video id (optional) to make runs reproducible.
+        try:
+            random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
+        except Exception:
+            pass
+
+        # 1) Jitter in pad position (keep inside canvas)
+        jx = random.randint(-2, 2)
+        jy = random.randint(-2, 2)
+        x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
+        y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
+
+        # 2) Tiny noise to alter frame hash (still looks identical)
+        noise_strength = random.choice([1, 2, 3])  # very subtle
+
+        # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
+        atempo = random.choice([0.99, 1.0, 1.01])
+
+
         fc = ""
-        fc += f"[0:v]crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},scale={out_cw}:{out_ch}:flags=lanczos,pad={CANVAS_W}:{CANVAS_H}:{x0}:{y0}:black[base];"
+        fc += f"[0:v]crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},scale={out_cw}:{out_ch}:flags=lanczos,pad={CANVAS_W}:{CANVAS_H}:{x0}:{y0}:black,noise=alls=2:allf=t[base];"
         fc += f"[1:v]scale={logo_out_w}:{logo_out_h}[logo];"
         fc += f"[base][logo]overlay={x_logo}:{y_logo}[v0];"
 
@@ -543,24 +565,61 @@ def render_binary():
         fc += (
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
-            f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28[vout]"
+            f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28,"
+            f"fps=30[vout]"
         )
+
 
         app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
             "ffmpeg", "-y",
+            "-ss", "0.35",
             "-i", in_path,
             "-i", logo_path,
             "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
+            "-filter:a", f"atempo={atempo},volume=1.02",
+            "-af", "atempo=1.01,volume=1.02",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             out_path
         ]
 
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+
+        # fallback 1: se falhar, tenta SEM -ss
+        if r.returncode != 0 or not os.path.exists(out_path):
+            if "-ss" in cmd:
+                cmd2 = cmd.copy()
+                i = cmd2.index("-ss")
+                del cmd2[i:i+2]
+                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
+        
+        # fallback 2: se falhar, tenta SEM áudio (remove -map 0:a? e -af e setar -an)
+        if r.returncode != 0 or not os.path.exists(out_path):
+            cmd3 = []
+            skip_next = False
+            for j, tok in enumerate(cmd):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in ("-af",):
+                    skip_next = True
+                    continue
+                if tok == "-map" and j + 1 < len(cmd) and cmd[j+1] == "0:a?":
+                    skip_next = True
+                    continue
+                if tok in ("-c:a", "-b:a"):
+                    skip_next = True
+                    continue
+                cmd3.append(tok)
+            # garante sem áudio
+            if "-an" not in cmd3:
+                cmd3.insert(cmd3.index("-c:v"), "-an")
+            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
 
         if r.returncode != 0 or not os.path.exists(out_path):
             app.logger.error("[render_binary] ffmpeg FAILED")
