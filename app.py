@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify, send_file
-import yt_dlp
 import os
 import re
 import textwrap
@@ -9,33 +8,8 @@ import subprocess
 import urllib.request
 import base64
 import json
+import random
 
-COOKIES_PATH = "/tmp/cookies.txt"
-
-def ensure_ig_cookies() -> str | None:
-    """Ensure cookies.txt is available at /tmp for yt-dlp.
-    Returns cookie path or None."""
-    try:
-        # If already staged in /tmp and has content, use it
-        if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 20:
-            return COOKIES_PATH
-
-        # Prefer repo cookies.txt (same dir as app.py), then CWD
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates = [
-            os.path.join(here, "cookies.txt"),
-            os.path.join(os.getcwd(), "cookies.txt"),
-            os.environ.get("IG_COOKIES_FILE", "").strip(),
-        ]
-        for p in candidates:
-            if p and os.path.exists(p) and os.path.getsize(p) > 20:
-                # copy to /tmp to avoid read-only paths
-                with open(p, "rb") as src, open(COOKIES_PATH, "wb") as dst:
-                    dst.write(src.read())
-                return COOKIES_PATH
-    except Exception:
-        return None
-    return None
 
 
 
@@ -58,51 +32,12 @@ def health():
 # ======================================================
 @app.get("/get")
 def get_direct():
-    url = request.args.get("url")
-
-    # Simple anti-429 throttle for Instagram
-    if url and ("instagram.com" in url or "instagr.am" in url):
-        import time, random
-        dmin = float(os.environ.get("IG_DELAY_MIN", "30"))
-        dmax = float(os.environ.get("IG_DELAY_MAX", "60"))
-        time.sleep(random.uniform(dmin, dmax))
-    if not url:
-        return jsonify({"error": "missing url"}), 400
-
-    ydl_opts = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "format": "best",
-    "retries": 5,
-    "extractor_retries": 5,
-    "fragment_retries": 5,
-    "socket_timeout": 30,
-    "sleep_requests": 1.0,
-    "sleep_interval": 1.0,
-    "max_sleep_interval": 3.0,
-    "concurrent_fragment_downloads": 1,
-    "nocheckcertificate": True,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-        "Referer": "https://www.instagram.com/",
-    },
-    }
-
-    cookies = ensure_ig_cookies()
-    if cookies:
-        ydl_opts["cookiefile"] = COOKIES_PATH
-
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            direct = info.get("url")
-            if not direct:
-                return jsonify({"error": "no direct url returned"}), 500
-            return jsonify({"directUrl": direct})
-    except Exception as e:
-        return jsonify({"error": "yt-dlp failed", "details": str(e)[:1200]}), 500
+    # yt-dlp removido do projeto. Este endpoint permanece apenas para não quebrar integrações.
+    # Use /still passando directUrl (CDN mp4) ou envie o mp4 direto para /render_binary.
+    return jsonify({
+        "error": "disabled",
+        "details": "yt-dlp removed from this service. Provide a direct mp4 URL to /still via directUrl, or upload the mp4 to /render_binary."
+    }), 501
 
 
 # ======================================================
