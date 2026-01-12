@@ -74,12 +74,18 @@ def get_direct():
     "no_warnings": True,
     "noplaylist": True,
     "format": "best",
-    "retries": 3,
-    "fragment_retries": 3,
-    "sleep_interval": 2,
-    "max_sleep_interval": 6,
+    "retries": 5,
+    "extractor_retries": 5,
+    "fragment_retries": 5,
+    "socket_timeout": 30,
+    "sleep_requests": 1.0,
+    "sleep_interval": 1.0,
+    "max_sleep_interval": 3.0,
+    "concurrent_fragment_downloads": 1,
+    "nocheckcertificate": True,
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "Referer": "https://www.instagram.com/",
     },
     }
 
