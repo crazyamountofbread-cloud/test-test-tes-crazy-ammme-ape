@@ -10,10 +10,8 @@ import base64
 import json
 import random
 
-
-
-
 app = Flask(__name__)
+
 @app.get("/")
 def root():
     return jsonify({"ok": True})
@@ -129,9 +127,10 @@ def ff_escape_text(s: str) -> str:
 # ======================================================
 # Helpers (new crop + auto-fit)
 # ======================================================
-
 from dataclasses import dataclass
 from PIL import ImageFont
+import numpy as np
+import cv2
 
 # ---- Font helpers (Pillow on some Linux builds can't load variable fonts) ----
 def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
@@ -151,8 +150,6 @@ def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
     raise RuntimeError(
         "No usable TTF font found. Provide a static .ttf via FONTFILE env or include one in ./fonts."
     )
-import numpy as np
-import cv2
 
 @dataclass
 class BBox:
@@ -348,15 +345,9 @@ def render_binary():
     ]
     fontfile = resolve_font_path(font_candidates)
 
-    logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
-
     if not os.path.exists(fontfile):
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
         return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
-
-    if not os.path.exists(logo_path):
-        app.logger.error(f"[render_binary] logo missing: {logo_path}")
-        return jsonify({"error": "missing Logo.png on server", "path": logo_path}), 500
 
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
@@ -403,12 +394,19 @@ def render_binary():
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 1080, 1920
 
-        # scale cropped to fit canvas
+        # scale cropped to fit canvas (foreground)
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
         out_cw = int(round(bbox.w * scale))
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
+
+        # --- background video: same crop, scaled higher to cover canvas, 50% opacity ---
+        bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
+        bg_w = int(round(bbox.w * bg_scale))
+        bg_h = int(round(bbox.h * bg_scale))
+        bg_x = (CANVAS_W - bg_w) // 2
+        bg_y = (CANVAS_H - bg_h) // 2
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 5
@@ -432,21 +430,6 @@ def render_binary():
         for lw in fit.line_ws:
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
-
-        # --- LOGO between top edge and top text block ---
-        logo_w, logo_h = ffprobe_dims(logo_path)
-        avail_logo_h = y_block
-        max_logo_w = int(CANVAS_W * 0.35)
-        max_logo_h = int(avail_logo_h * 0.80) if avail_logo_h > 0 else 0
-        logo_scale = 1.0
-        if max_logo_w > 0 and max_logo_h > 0:
-            logo_scale = min(max_logo_w / logo_w, max_logo_h / logo_h, 1.0)
-        logo_out_w = max(1, int(round(logo_w * logo_scale)))
-        logo_out_h = max(1, int(round(logo_h * logo_scale)))
-        x_logo = (CANVAS_W - logo_out_w) // 2
-        y_logo = (y_block - logo_out_h) // 2
-        if y_logo < 0:
-            y_logo = 0
 
         # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
         cta_text = "Siga @SuperEmAlta"
@@ -485,21 +468,33 @@ def render_binary():
         # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
         atempo = random.choice([0.99, 1.0, 1.01])
 
-
+        # NOTE: agora NÃO tem Logo.png. Fundo é o próprio vídeo (crop) ampliado e com 50% opacidade.
         fc = ""
+
+        # Base/background: crop -> scale cover -> pad -> format rgba -> alpha 0.5
+        fc += (
+            f"[0:v]"
+            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
+            f"scale={bg_w}:{bg_h}:flags=lanczos,"
+            f"setsar=1,setdar=9/16,"
+            f"pad={CANVAS_W}:{CANVAS_H}:{bg_x}:{bg_y}:black,"
+            f"format=rgba,"
+            f"colorchannelmixer=aa=0.50"
+            f"[bg];"
+        )
+
+        # Foreground/main: crop -> scale fit -> pad (transparent) -> overlay on bg -> noise
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1,setdar=9/16,"
-            f"pad={CANVAS_W}:{CANVAS_H}:{x0j}:{y0j}:black,"
-            f"setsar=1,setdar=9/16,"
-            f"noise=alls=2:allf=t"
-            f"[base];"
+            f"pad={CANVAS_W}:{CANVAS_H}:{x0j}:{y0j}:color=black@0,"
+            f"format=rgba"
+            f"[fg];"
         )
 
-        fc += f"[1:v]scale={logo_out_w}:{logo_out_h}[logo];"
-        fc += f"[base][logo]overlay={x_logo}:{y_logo}[v0];"
+        fc += f"[bg][fg]overlay=0:0,noise=alls=2:allf=t[v0];"
 
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
@@ -520,13 +515,11 @@ def render_binary():
             f"fps=30[vout]"
         )
 
-
         app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
             "-i", in_path,
-            "-i", logo_path,
             "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
@@ -548,7 +541,7 @@ def render_binary():
                 i = cmd2.index("-ss")
                 del cmd2[i:i+2]
                 r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
-        
+
         # fallback 2: se falhar, tenta SEM áudio (remove -map 0:a? e -af e setar -an)
         if r.returncode != 0 or not os.path.exists(out_path):
             cmd3 = []
