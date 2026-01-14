@@ -405,8 +405,6 @@ def render_binary():
         bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
         bg_w = int(round(bbox.w * bg_scale))
         bg_h = int(round(bbox.h * bg_scale))
-        bg_x = (CANVAS_W - bg_w) // 2
-        bg_y = (CANVAS_H - bg_h) // 2
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 5
@@ -450,7 +448,6 @@ def render_binary():
         # ======================================================
         # Anti-fingerprint micro-variations (imperceptible)
         # ======================================================
-        # Use stable randomness per video id (optional) to make runs reproducible.
         try:
             random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
         except Exception:
@@ -463,27 +460,25 @@ def render_binary():
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
         # 2) Tiny noise to alter frame hash (still looks identical)
-        noise_strength = random.choice([1, 2, 3])  # very subtle
+        noise_strength = random.choice([1, 2, 3])  # very subtle (kept)
 
         # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
         atempo = random.choice([0.99, 1.0, 1.01])
 
-        # NOTE: agora NÃO tem Logo.png. Fundo é o próprio vídeo (crop) ampliado e com 50% opacidade.
+        # Fundo: SCALE (cover) + CROP pro canvas (em vez de pad) -> alpha 0.5
+        # Foreground: fit + pad transparente -> overlay em cima do fundo
         fc = ""
 
-        # Base/background: crop -> scale cover -> pad -> format rgba -> alpha 0.5
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={bg_w}:{bg_h}:flags=lanczos,"
-            f"setsar=1,setdar=9/16,"
-            f"pad={CANVAS_W}:{CANVAS_H}:{bg_x}:{bg_y}:black,"
+            f"crop={CANVAS_W}:{CANVAS_H}:(in_w-{CANVAS_W})/2:(in_h-{CANVAS_H})/2,"
             f"format=rgba,"
             f"colorchannelmixer=aa=0.50"
             f"[bg];"
         )
 
-        # Foreground/main: crop -> scale fit -> pad (transparent) -> overlay on bg -> noise
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
