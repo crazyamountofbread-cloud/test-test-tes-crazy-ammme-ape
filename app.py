@@ -9,8 +9,52 @@ import urllib.request
 import base64
 import json
 import random
+import time
+import uuid
+import fcntl
 
 app = Flask(__name__)
+
+# ======================================================
+# Global single-file queue lock (1 request at a time)
+# Works across gunicorn workers/processes.
+# ======================================================
+LOCK_PATH = os.environ.get("RENDER_LOCK_PATH", "/tmp/render_binary.lock")
+LOCK_WAIT_S = int(os.environ.get("RENDER_LOCK_WAIT_S", "3600"))  # max wait in queue
+
+def acquire_render_lock():
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
+    f = os.fdopen(fd, "r+")
+    start = time.time()
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # write current holder info (debug)
+            f.seek(0)
+            f.truncate()
+            f.write(f"pid={os.getpid()} ts={time.time()}\n")
+            f.flush()
+            return f
+        except BlockingIOError:
+            if time.time() - start > LOCK_WAIT_S:
+                try:
+                    f.close()
+                except:
+                    pass
+                raise TimeoutError("render queue lock timeout")
+            time.sleep(0.25)
+
+def release_render_lock(f):
+    try:
+        fcntl.flock(f, fcntl.LOCK_UN)
+    except:
+        pass
+    try:
+        f.close()
+    except:
+        pass
+
+FFMPEG_TIMEOUT_S = int(os.environ.get("FFMPEG_TIMEOUT_S", "900"))
 
 @app.get("/")
 def root():
@@ -329,8 +373,18 @@ def render_binary():
     f = request.files["file"]
     caption = normalize_text(request.form.get("caption", ""))
 
-    vid_id = re.sub(r"[^a-zA-Z0-9_-]", "", request.form.get("id", "video"))
-    tmp_dir = tempfile.mkdtemp(prefix="render_")
+    request_id = uuid.uuid4().hex[:12]
+    lock_f = None
+    try:
+        app.logger.info("[render_binary %s] waiting queue lock", request_id)
+        lock_f = acquire_render_lock()
+        app.logger.info("[render_binary %s] acquired queue lock", request_id)
+    except Exception as e:
+        app.logger.error("[render_binary %s] queue lock error: %s", request_id, str(e))
+        return jsonify({"error": "queue lock error", "details": str(e)[:2000]}), 503
+
+    vid_id = re.sub(r"[^a-zA-Z0-9_-]", "", request.form.get("id", request_id))
+    tmp_dir = tempfile.mkdtemp(prefix=f"render_{request_id}_")
 
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
@@ -354,6 +408,14 @@ def render_binary():
         # Speed tweak (audio)
         atempo = float(request.form.get("atempo", "1.0") or "1.0")
         atempo = max(0.5, min(2.0, atempo))
+
+        # Encoding speed/quality knobs (defaults are tuned for Render stability)
+        preset = (request.form.get("preset") or os.environ.get("X264_PRESET", "ultrafast")).strip() or "ultrafast"
+        try:
+            crf = int(request.form.get("crf") or os.environ.get("X264_CRF", "23"))
+        except Exception:
+            crf = 23
+        crf = max(16, min(35, crf))
 
         # Random micro-jitter deterministic by vid_id
         random.seed(vid_id)
@@ -383,18 +445,6 @@ def render_binary():
         x0j = clamp(x0 + jx, 0, CANVAS_W - out_cw)
         y0j = clamp(y0 + jy, 0, CANVAS_H - out_ch)
 
-        # Background scale: fill canvas, allow blur
-        # We scale bbox crop to cover canvas (cover, not contain)
-        ar = cw / ch if ch else 1.0
-        tar = CANVAS_W / CANVAS_H
-        if ar >= tar:
-            # wider -> fit height
-            bg_h = CANVAS_H
-            bg_w = int(bg_h * ar)
-        else:
-            bg_w = CANVAS_W
-            bg_h = int(bg_w / ar)
-
         # Font path (prefer bundled GoogleSans, fallback to DejaVu)
         font_candidates = [
             os.environ.get("FONTFILE", ""),
@@ -418,20 +468,19 @@ def render_binary():
         caption_font_size = int(request.form.get("caption_font_size", "64") or "64")
         caption_y = int(request.form.get("caption_y", "1490") or "1490")
 
-        # Blur do fundo (leve/médio) + opacidade 35%
-        # Stroke preto ~4px nos textos via borderw=4
-
         # =======================
-        # FILTER GRAPH (PATCHED)
+        # FILTER GRAPH (FAST BG)
         # =======================
         fc = f"[0:v]split=2[vbgsrc][vfgsrc];"
 
+        # Background: blur at half-res then upscale (MUCH faster)
         fc += (
             f"[vbgsrc]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
-            f"scale={bg_w}:{bg_h}:flags=lanczos,"
-            f"crop={CANVAS_W}:{CANVAS_H}:(in_w-{CANVAS_W})/2:(in_h-{CANVAS_H})/2,"
-            f"gblur=sigma=18,"
+            f"scale={CANVAS_W}:{CANVAS_H}:flags=bicubic,"
+            f"scale=540:960:flags=bicubic,"
+            f"gblur=sigma=12,"
+            f"scale={CANVAS_W}:{CANVAS_H}:flags=bicubic,"
             f"format=rgba,"
             f"colorchannelmixer=aa=0.35"
             f"[bg];"
@@ -486,7 +535,7 @@ def render_binary():
             "-map", "[vout]",
             "-map", "0:a?",
             "-af", f"atempo={atempo},volume=1.02",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
@@ -494,7 +543,7 @@ def render_binary():
             out_path
         ]
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
 
         # fallback 1: se falhar, tenta SEM -ss
         if r.returncode != 0 or not os.path.exists(out_path):
@@ -510,7 +559,7 @@ def render_binary():
                         continue
                     cmd2.append(tok)
                 app.logger.warning("[render_binary] ffmpeg failed w/ -ss, retrying without -ss")
-                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
+                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
 
         # fallback 2: se falhar, tenta SEM áudio (remove -map 0:a? e -af e setar -an)
         if r.returncode != 0 or not os.path.exists(out_path):
@@ -533,7 +582,7 @@ def render_binary():
             if "-an" not in cmd3:
                 cmd3.insert(cmd3.index(out_path), "-an")
             app.logger.warning("[render_binary] ffmpeg failed w/ audio, retrying without audio")
-            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
+            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
 
         if r.returncode != 0 or not os.path.exists(out_path):
             app.logger.error("[render_binary] ffmpeg FAILED")
@@ -560,7 +609,13 @@ def render_binary():
         return jsonify({"error": "render exception", "details": str(e)[:2000]}), 500
 
     finally:
+        # release queue lock
+        if 'lock_f' in locals() and lock_f is not None:
+            release_render_lock(lock_f)
+
         # cleanup tmp dir
+        if 'tmp_dir' not in locals() or not tmp_dir:
+            pass
         try:
             for fn in os.listdir(tmp_dir):
                 try:
