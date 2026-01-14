@@ -401,7 +401,7 @@ def render_binary():
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
 
-        # --- background video: same crop, scaled higher to cover canvas, 50% opacity ---
+        # --- background video: same crop, scaled higher to cover canvas ---
         bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
         bg_w = int(round(bbox.w * bg_scale))
         bg_h = int(round(bbox.h * bg_scale))
@@ -442,7 +442,7 @@ def render_binary():
             y_cta = max(0, CANVAS_H - cta_h)
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
 
-        # --- ffmpeg filter_complex (new motor) ---
+        # --- ffmpeg filter_complex ---
         font_ff = escape_filter_path(fontfile)
 
         # ======================================================
@@ -453,20 +453,17 @@ def render_binary():
         except Exception:
             pass
 
-        # 1) Jitter in pad position (keep inside canvas)
+        # Jitter do foreground (mantém)
         jx = random.randint(-2, 2)
         jy = random.randint(-2, 2)
         x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
-        # 2) Tiny noise to alter frame hash (still looks identical)
-        noise_strength = random.choice([1, 2, 3])  # very subtle (kept)
-
-        # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
+        # Tiny audio tempo shift (mantém)
         atempo = random.choice([0.99, 1.0, 1.01])
 
-        # Fundo: SCALE (cover) + CROP pro canvas (em vez de pad) -> alpha 0.5
-        # Foreground: fit + pad transparente -> overlay em cima do fundo
+        # Blur do fundo (leve/médio) + opacidade 35%
+        # Stroke preto ~4px nos textos via borderw=4
         fc = ""
 
         fc += (
@@ -474,8 +471,9 @@ def render_binary():
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={bg_w}:{bg_h}:flags=lanczos,"
             f"crop={CANVAS_W}:{CANVAS_H}:(in_w-{CANVAS_W})/2:(in_h-{CANVAS_H})/2,"
+            f"gblur=sigma=18,"
             f"format=rgba,"
-            f"colorchannelmixer=aa=0.50"
+            f"colorchannelmixer=aa=0.35"
             f"[bg];"
         )
 
@@ -489,7 +487,7 @@ def render_binary():
             f"[fg];"
         )
 
-        fc += f"[bg][fg]overlay=0:0,noise=alls=2:allf=t[v0];"
+        fc += f"[bg][fg]overlay=0:0[v0];"
 
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
@@ -498,7 +496,9 @@ def render_binary():
             fc += (
                 f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
                 f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
-                f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28[{v_out}];"
+                f"fontcolor=white:"
+                f"bordercolor=black:borderw=4:"
+                f"box=0[{v_out}];"
             )
             v_in = v_out
 
@@ -506,11 +506,13 @@ def render_binary():
         fc += (
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
-            f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28,"
+            f"fontcolor=white:"
+            f"bordercolor=black:borderw=4:"
+            f"box=0,"
             f"fps=30[vout]"
         )
 
-        app.logger.info("[render_binary] running ffmpeg (new motor)")
+        app.logger.info("[render_binary] running ffmpeg")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
@@ -555,7 +557,6 @@ def render_binary():
                     skip_next = True
                     continue
                 cmd3.append(tok)
-            # garante sem áudio
             if "-an" not in cmd3:
                 cmd3.insert(cmd3.index("-c:v"), "-an")
             r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
