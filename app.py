@@ -8,6 +8,7 @@ import subprocess
 import urllib.request
 import base64
 import json
+import math
 import random
 
 app = Flask(__name__)
@@ -396,17 +397,25 @@ def render_binary():
 
         # scale cropped to fit canvas (foreground)
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
-        out_cw = int(round(bbox.w * scale))
-        out_ch = int(round(bbox.h * scale))
+        out_cw = int(math.floor(bbox.w * scale))
+        out_ch = int(math.floor(bbox.h * scale))
+        out_cw = min(CANVAS_W, max(2, out_cw))
+        out_ch = min(CANVAS_H, max(2, out_ch))
+        if out_cw % 2: out_cw -= 1
+        if out_ch % 2: out_ch -= 1
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
 
         # --- background video: same crop, scaled higher to cover canvas, 50% opacity ---
         bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
-        bg_w = int(round(bbox.w * bg_scale))
-        bg_h = int(round(bbox.h * bg_scale))
-        bg_x = (CANVAS_W - bg_w) // 2
-        bg_y = (CANVAS_H - bg_h) // 2
+        bg_w = int(math.ceil(bbox.w * bg_scale))
+        bg_h = int(math.ceil(bbox.h * bg_scale))
+        bg_w = max(CANVAS_W, bg_w)
+        bg_h = max(CANVAS_H, bg_h)
+        if bg_w % 2: bg_w += 1
+        if bg_h % 2: bg_h += 1
+        bg_crop_x = max(0, (bg_w - CANVAS_W) // 2)
+        bg_crop_y = max(0, (bg_h - CANVAS_H) // 2)
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 5
@@ -477,7 +486,7 @@ def render_binary():
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={bg_w}:{bg_h}:flags=lanczos,"
             f"setsar=1,setdar=9/16,"
-            f"pad={CANVAS_W}:{CANVAS_H}:{bg_x}:{bg_y}:black,"
+            f"crop={CANVAS_W}:{CANVAS_H}:{bg_crop_x}:{bg_crop_y},"
             f"format=rgba,"
             f"colorchannelmixer=aa=0.50"
             f"[bg];"
