@@ -9,52 +9,8 @@ import urllib.request
 import base64
 import json
 import random
-import time
-import uuid
-import fcntl
 
 app = Flask(__name__)
-
-# ======================================================
-# Global single-file queue lock (1 request at a time)
-# Works across gunicorn workers/processes.
-# ======================================================
-LOCK_PATH = os.environ.get("RENDER_LOCK_PATH", "/tmp/render_binary.lock")
-LOCK_WAIT_S = int(os.environ.get("RENDER_LOCK_WAIT_S", "3600"))  # max wait in queue
-
-def acquire_render_lock():
-    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
-    f = os.fdopen(fd, "r+")
-    start = time.time()
-    while True:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # write current holder info (debug)
-            f.seek(0)
-            f.truncate()
-            f.write(f"pid={os.getpid()} ts={time.time()}\n")
-            f.flush()
-            return f
-        except BlockingIOError:
-            if time.time() - start > LOCK_WAIT_S:
-                try:
-                    f.close()
-                except:
-                    pass
-                raise TimeoutError("render queue lock timeout")
-            time.sleep(0.25)
-
-def release_render_lock(f):
-    try:
-        fcntl.flock(f, fcntl.LOCK_UN)
-    except:
-        pass
-    try:
-        f.close()
-    except:
-        pass
-
-FFMPEG_TIMEOUT_S = int(os.environ.get("FFMPEG_TIMEOUT_S", "900"))
 
 @app.get("/")
 def root():
@@ -78,7 +34,7 @@ def get_direct():
     # Use /still passando directUrl (CDN mp4) ou envie o mp4 direto para /render_binary.
     return jsonify({
         "error": "disabled",
-        "details": "yt-dlp removed from this service. Provide...to /still via directUrl, or upload the mp4 to /render_binary."
+        "details": "yt-dlp removed from this service. Provide a direct mp4 URL to /still via directUrl, or upload the mp4 to /render_binary."
     }), 501
 
 
@@ -92,12 +48,12 @@ def still():
         return jsonify({"error": "missing directUrl"}), 400
 
     tmp_dir = tempfile.mkdtemp(prefix="still_")
-    out_path = os.path.join(tmp_dir, "frame.jpg")
+    out_path = os.path.join(tmp_dir, "still.jpg")
 
     cmd = [
         "ffmpeg",
         "-y",
-        "-loglevel", "error",
+        "-ss", "0.2",
         "-i", direct_url,
         "-frames:v", "1",
         "-q:v", "2",
@@ -113,100 +69,58 @@ def still():
             }), 500
         return send_file(out_path, mimetype="image/jpeg")
     except Exception as e:
-        return jsonify({"error": "exception", "details": str(e)}), 500
+        return jsonify({"error": "still exception", "details": str(e)[:1200]}), 500
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            os.rmdir(tmp_dir)
+        except:
+            pass
 
 
 # ======================================================
-# Text helpers
+# Helpers (render)
 # ======================================================
-def normalize_text(s: str) -> str:
+def sanitize_caption(s: str) -> str:
+    s = s.replace("\r", "").lstrip("\ufeff")
     s = unicodedata.normalize("NFKC", s)
+
+    out = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat[0] == "C":
+            continue
+        if cat == "So":  # emojis removidos
+            continue
+        out.append(ch)
+
+    s = "".join(out)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def wrap_caption_two_lines(s: str, width: int = 26):
-    """Wrap caption into at most 2 lines. If longer, ellipsis."""
-    s = normalize_text(s)
-    if not s:
-        return "", ""
+def make_caption_lines(caption: str, width: int = 28, max_lines: int = 2):
+    s = sanitize_caption(caption)
+    lines = textwrap.wrap(s, width=width, break_long_words=False, break_on_hyphens=False)
 
-    lines = textwrap.wrap(s, width=width)
-    if len(lines) <= 2:
-        if len(lines) == 1:
-            return lines[0], ""
-        return lines[0], lines[1]
-
-    # Merge rest into 2nd line and ellipsis
-    second = " ".join(lines[1:])
-    second = normalize_text(second)
-    # Hard cut if still huge
-    if len(second) > width * 2:
-        second = second[: width * 2].rstrip() + "…"
-
-    # Ensure second line doesn't exceed width too badly
-    lines2 = textwrap.wrap(second, width=width)
-    if not lines2:
-        return lines[0], ""
-
-    if len(lines2) >= 1:
-        line2 = lines2[0]
-        # Add ellipsis if there were more than one wrapped segment
-        if len(lines2) > 1:
-            # ensure ellipsis fits
-            if len(line2) >= width:
-                line2 = line2[: max(0, width - 1)].rstrip()
-            line2 = line2.rstrip() + "…"
-        return lines[0], line2
-
-    return lines[0], ""
-
-
-def wrap_caption_two_lines_for_ffmpeg(s: str, width: int = 26):
-    """Return two lines, each max width, suitable for drawtext with newline."""
-    l1, l2 = wrap_caption_two_lines(s, width=width)
-    if l2:
-        return f"{l1}\n{l2}"
-    return l1
-
-
-def wrap_caption_two_lines_strict(s: str, width: int = 26):
-    """Strict 2 lines: if line2 too long, ellipsis it."""
-    s = normalize_text(s)
-    if not s:
-        return "", ""
-
-    lines = textwrap.wrap(s, width=width)
-    if len(lines) == 1:
-        return lines[0], ""
-
-    line1 = lines[0]
-    line2 = " ".join(lines[1:])
-    line2 = normalize_text(line2)
-
-    # Ellipsis if it wraps further
-    line2_parts = textwrap.wrap(line2, width=width)
-    if len(line2_parts) > 1:
-        last = line2_parts[0]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
         if len(last) >= width:
             last = last[: max(0, width - 1)].rstrip()
-        line2 = last.rstrip() + "…"
-    else:
-        line2 = line2_parts[0] if line2_parts else ""
+        lines[-1] = last.rstrip() + "…"
 
+    line1 = lines[0] if len(lines) > 0 else ""
+    line2 = lines[1] if len(lines) > 1 else ""
     return line1, line2
 
 
 def ff_escape_text(s: str) -> str:
-    # Robust escaping for ffmpeg drawtext (prevents filter graph breaks)
     s = s.replace("\\", "\\\\")
     s = s.replace(":", r"\:")
-    s = s.replace(",", r"\,")
     s = s.replace("'", r"\'")
     s = s.replace("%", r"\%")
-    s = s.replace("\r", "")
-    s = s.replace("\n", r"\n")
-    s = s.replace("[", r"\[").replace("]", r"\]")
     return s
 
 
@@ -233,13 +147,9 @@ def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
                 return p
             except Exception:
                 continue
-    raise RuntimeError("No usable TTF font found from candidates.")
-
-
-def escape_filter_path(p: str) -> str:
-    """Escape fontfile path for ffmpeg filter (Windows not needed on Render, but safe)."""
-    return p.replace("\\", "\\\\").replace(":", r"\:").replace(",", r"\,")
-
+    raise RuntimeError(
+        "No usable TTF font found. Provide a static .ttf via FONTFILE env or include one in ./fonts."
+    )
 
 @dataclass
 class BBox:
@@ -248,246 +158,327 @@ class BBox:
     w: int
     h: int
 
+def ffprobe_dims(path: str):
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", path
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr)
+    data = json.loads(p.stdout)
+    st = data["streams"][0]
+    return int(st["width"]), int(st["height"])
 
-def detect_foreground_bbox(video_path: str, max_frames: int = 20, sample_stride: int = 10) -> BBox:
-    """
-    Detect foreground bbox by motion + edges. Robust against black bars and static background.
-    Returns bbox in original video coordinates.
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video for bbox detection")
+def extract_frame(in_video: str, out_png: str, t: float) -> bool:
+    cmd = ["ffmpeg", "-y", "-ss", str(t), "-i", in_video, "-vframes", "1", "-q:v", "2", out_png]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0 and os.path.exists(out_png)
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+def detect_bg_color(img_bgr: np.ndarray):
+    h, w = img_bgr.shape[:2]
+    band = max(8, h // 50)
+    top = img_bgr[:band, :, :]
+    bot = img_bgr[h-band:, :, :]
 
-    frames = []
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    if frame_count <= 0:
-        frame_count = 999999
+    b = np.concatenate([top[...,0].astype(np.float32), bot[...,0].astype(np.float32)], axis=0)
+    g = np.concatenate([top[...,1].astype(np.float32), bot[...,1].astype(np.float32)], axis=0)
+    r = np.concatenate([top[...,2].astype(np.float32), bot[...,2].astype(np.float32)], axis=0)
+    luma = 0.114*b + 0.587*g + 0.299*r
+    m = float(np.mean(luma))
+    return (255,255,255) if m >= 128 else (0,0,0)
 
-    # sample indices
-    idxs = []
-    start = min(5, frame_count - 1)
-    step = max(1, sample_stride)
-    for k in range(start, min(frame_count, start + max_frames * step), step):
-        idxs.append(k)
+def smooth1d(x: np.ndarray, k: int) -> np.ndarray:
+    k = max(5, k | 1)
+    kernel = np.ones(k, dtype=np.float32) / k
+    return np.convolve(x, kernel, mode="same")
 
-    prev_gray = None
-    agg = np.zeros((h, w), dtype=np.float32)
+def largest_contiguous_segment(idx: np.ndarray):
+    if idx.size == 0:
+        return None
+    d = np.diff(idx)
+    breaks = np.where(d > 1)[0]
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends   = np.r_[idx[breaks], idx[-1]]
+    lengths = ends - starts + 1
+    j = int(np.argmax(lengths))
+    return int(starts[j]), int(ends[j])
 
-    for target in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-        ok, frame = cap.read()
-        if not ok or frame is None:
+def build_content_mask(img_bgr: np.ndarray, tol: int) -> np.ndarray:
+    bg = np.array(detect_bg_color(img_bgr), dtype=np.int16)
+    img16 = img_bgr.astype(np.int16)
+    diff = np.max(np.abs(img16 - bg[None, None, :]), axis=2)
+    content = (diff > tol).astype(np.uint8)
+
+    h, w = img_bgr.shape[:2]
+    k = max(3, (min(h, w) // 280) | 1)
+    kernel = np.ones((k, k), np.uint8)
+    content = cv2.morphologyEx(content, cv2.MORPH_OPEN, kernel, iterations=1)
+    content = cv2.morphologyEx(content, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return content
+
+def find_bbox_ignore_overlay(img_bgr: np.ndarray, tol: int = 28, row_thresh: float = 0.08):
+    # y_only: corta só topo/baixo, mantém largura total
+    h, w = img_bgr.shape[:2]
+    content = build_content_mask(img_bgr, tol=tol)
+    row_frac = np.mean(content, axis=1)
+    row_frac_s = smooth1d(row_frac, k=max(11, h // 120))
+    rows = np.where(row_frac_s > row_thresh)[0]
+    seg = largest_contiguous_segment(rows)
+    if seg is None:
+        raise RuntimeError("bbox not found")
+    y1, y2 = seg
+    return BBox(x=0, y=y1, w=w, h=(y2 - y1 + 1))
+
+def median_bbox(bboxes):
+    xs = np.array([b.x for b in bboxes], dtype=np.int32)
+    ys = np.array([b.y for b in bboxes], dtype=np.int32)
+    ws = np.array([b.w for b in bboxes], dtype=np.int32)
+    hs = np.array([b.h for b in bboxes], dtype=np.int32)
+    return BBox(int(np.median(xs)), int(np.median(ys)), int(np.median(ws)), int(np.median(hs)))
+
+def escape_filter_path(p: str) -> str:
+    return p.replace("\\", "\\\\").replace(":", r"\:").replace(",", r"\,")
+
+@dataclass
+class FitResult:
+    font_size: int
+    lines: list
+    text_h: int
+    line_h: int
+    line_ws: list
+
+def wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int):
+    words = text.strip().split()
+    if not words:
+        return [""]
+    def width(s: str) -> int:
+        bb = font.getbbox(s)
+        return bb[2] - bb[0]
+    lines = []
+    cur = words[0]
+    for w in words[1:]:
+        t = cur + " " + w
+        if width(t) <= max_w:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    fixed = []
+    for ln in lines:
+        if width(ln) <= max_w:
+            fixed.append(ln)
             continue
+        buf = ""
+        for ch in ln:
+            tt = buf + ch
+            if width(tt) <= max_w or not buf:
+                buf = tt
+            else:
+                fixed.append(buf)
+                buf = ch
+        if buf:
+            fixed.append(buf)
+    return fixed
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+def measure_lines(lines, font: ImageFont.FreeTypeFont, line_spacing: float):
+    b = font.getbbox("Ag")
+    base_line_h = (b[3] - b[1])
+    line_h = int(round(base_line_h * line_spacing))
+    widths = []
+    for ln in lines:
+        bb = font.getbbox(ln)
+        widths.append(bb[2] - bb[0])
+    text_h = line_h * len(lines) - (line_h - base_line_h)
+    return text_h, line_h, widths
 
-        if prev_gray is None:
-            prev_gray = gray_blur
+def fit_text_top(text: str, font_path: str, max_w: int, max_h: int,
+                 max_font: int = 96, min_font: int = 34,
+                 line_spacing: float = 1.15, max_lines: int = 3):
+    text = sanitize_caption(text)
+    for size in range(max_font, min_font - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text_to_width(text, font, max_w)
+        if len(lines) > max_lines:
             continue
-
-        diff = cv2.absdiff(gray_blur, prev_gray)
-        prev_gray = gray_blur
-
-        # edges
-        edges = cv2.Canny(gray_blur, 70, 140)
-
-        # combine diff + edges
-        m = cv2.normalize(diff.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX)
-        e = cv2.normalize(edges.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX)
-
-        combo = 0.65 * m + 0.35 * e
-        agg += combo
-
-    cap.release()
-
-    if np.max(agg) <= 1e-6:
-        # fallback: full frame
-        return BBox(0, 0, w, h)
-
-    agg = agg / (np.max(agg) + 1e-9)
-    # threshold
-    mask = (agg > 0.15).astype(np.uint8) * 255
-
-    # morph to fill holes
-    kernel = np.ones((15, 15), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return BBox(0, 0, w, h)
-
-    cnt = max(cnts, key=cv2.contourArea)
-    x, y, bw, bh = cv2.boundingRect(cnt)
-
-    # expand slightly
-    pad_x = int(bw * 0.06)
-    pad_y = int(bh * 0.06)
-    x = max(0, x - pad_x)
-    y = max(0, y - pad_y)
-    bw = min(w - x, bw + 2 * pad_x)
-    bh = min(h - y, bh + 2 * pad_y)
-
-    # sanity: minimum coverage
-    if bw < int(w * 0.3) or bh < int(h * 0.3):
-        return BBox(0, 0, w, h)
-
-    return BBox(x, y, bw, bh)
-
-
-def compute_scale_to_fit(w: int, h: int, target_w: int, target_h: int):
-    """Return scale (out_w, out_h) to fit inside target while preserving aspect ratio."""
-    if w <= 0 or h <= 0:
-        return target_w, target_h
-
-    ar = w / h
-    tar = target_w / target_h
-
-    if ar >= tar:
-        # wider -> fit width
-        out_w = target_w
-        out_h = int(target_w / ar)
-    else:
-        # taller -> fit height
-        out_h = target_h
-        out_w = int(target_h * ar)
-
-    return out_w, out_h
-
-
-def clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
+        text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+        if text_h <= max_h:
+            return FitResult(size, lines, text_h, line_h, line_ws)
+    font = ImageFont.truetype(font_path, min_font)
+    lines = wrap_text_to_width(text, font, max_w)[:max_lines]
+    text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+    return FitResult(min_font, lines, min(text_h, max_h), line_h, line_ws)
 
 
 # ======================================================
-# /render_binary  (upload mp4 -> final mp4)
+# /render_binary  (MAIN RENDER ENDPOINT)
 # ======================================================
 @app.post("/render_binary")
 def render_binary():
-    if "file" not in request.files:
-        return jsonify({"error": "missing file"}), 400
+    app.logger.info("[render_binary] START")
 
-    f = request.files["file"]
-    caption = normalize_text(request.form.get("caption", ""))
+    if "file" in request.files:
+        f = request.files["file"]
+    elif len(request.files) > 0:
+        f = next(iter(request.files.values()))
+    else:
+        app.logger.error("[render_binary] missing file")
+        return jsonify({
+            "error": "missing file",
+            "files_keys": list(request.files.keys())
+        }), 400
 
-    request_id = uuid.uuid4().hex[:12]
-    lock_f = None
-    try:
-        app.logger.info("[render_binary %s] waiting queue lock", request_id)
-        lock_f = acquire_render_lock()
-        app.logger.info("[render_binary %s] acquired queue lock", request_id)
-    except Exception as e:
-        app.logger.error("[render_binary %s] queue lock error: %s", request_id, str(e))
-        return jsonify({"error": "queue lock error", "details": str(e)[:2000]}), 503
+    caption = request.form.get("caption", "")
+    vid_id = str(request.form.get("id", "video"))
 
-    vid_id = re.sub(r"[^a-zA-Z0-9_-]", "", request.form.get("id", request_id))
-    tmp_dir = tempfile.mkdtemp(prefix=f"render_{request_id}_")
+    app.logger.info(f"[render_binary] id={vid_id} caption_len={len(caption)}")
+    app.logger.info(f"[render_binary] files_keys={list(request.files.keys())}")
 
+    # Font: try user-provided FONTFILE first, then common repo paths, then system fonts.
+    font_candidates = [
+        os.environ.get("FONTFILE", "").strip(),
+        "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
+        "./GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    fontfile = resolve_font_path(font_candidates)
+
+    if not os.path.exists(fontfile):
+        app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
+        return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
+
+    tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
 
-    f.save(in_path)
-
-    app.logger.info("[render_binary] START %s", in_path)
-
     try:
-        CANVAS_W = 1080
-        CANVAS_H = 1920
+        # save upload
+        f.save(in_path)
+        app.logger.info("[render_binary] file saved, detecting bbox")
 
-        # Caption styling
-        caption_width = int(request.form.get("caption_width", "26") or "26")
-        line1, line2 = wrap_caption_two_lines_strict(caption, width=caption_width)
+        # --- detect bbox (ignore overlay text) using a few frames ---
+        sample_times = [0.5, 1.2, 2.0, 3.0]
+        frames = []
+        for i, t in enumerate(sample_times):
+            fp = os.path.join(tmp_dir, f"___f{i}.png")
+            if extract_frame(in_path, fp, t):
+                frames.append(fp)
 
-        # CTA (optional)
-        cta = normalize_text(request.form.get("cta", ""))
-        cta_font_size = int(request.form.get("cta_font_size", "54") or "54")
+        bboxes = []
+        for fp in frames:
+            img = cv2.imread(fp, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            try:
+                bboxes.append(find_bbox_ignore_overlay(img, tol=28, row_thresh=0.08))
+            except Exception:
+                continue
 
-        # Speed tweak (audio)
-        atempo = float(request.form.get("atempo", "1.0") or "1.0")
-        atempo = max(0.5, min(2.0, atempo))
+        if not bboxes:
+            # fallback: assume full frame
+            w, h = ffprobe_dims(in_path)
+            bbox = BBox(0, 0, w, h)
+            app.logger.warning("[render_binary] bbox detection failed, using full frame")
+        else:
+            bbox = median_bbox(bboxes)
 
-        # Encoding speed/quality knobs (defaults are tuned for Render stability)
-        preset = (request.form.get("preset") or os.environ.get("X264_PRESET", "ultrafast")).strip() or "ultrafast"
-        try:
-            crf = int(request.form.get("crf") or os.environ.get("X264_CRF", "23"))
-        except Exception:
-            crf = 23
-        crf = max(16, min(35, crf))
+        src_w, src_h = ffprobe_dims(in_path)
+        # clamp bbox
+        bbox.x = max(0, min(bbox.x, src_w - 1))
+        bbox.y = max(0, min(bbox.y, src_h - 1))
+        bbox.w = max(1, min(bbox.w, src_w - bbox.x))
+        bbox.h = max(1, min(bbox.h, src_h - bbox.y))
 
-        # Random micro-jitter deterministic by vid_id
-        random.seed(vid_id)
+        # --- fixed 9:16 canvas ---
+        CANVAS_W, CANVAS_H = 1080, 1920
 
-        # --- Determine bbox (foreground), compute background sizing ---
-        bbox = detect_foreground_bbox(in_path)
-
-        cap = cv2.VideoCapture(in_path)
-        if not cap.isOpened():
-            raise RuntimeError("Could not open video for reading dims")
-        iw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        ih = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-
-        # foreground crop dims
-        cw = bbox.w
-        ch = bbox.h
-
-        # Fit foreground inside 9:16 canvas
-        out_cw, out_ch = compute_scale_to_fit(cw, ch, CANVAS_W, CANVAS_H)
+        # scale cropped to fit canvas (foreground)
+        scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
+        out_cw = int(round(bbox.w * scale))
+        out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
-        y0 = (CANVAS_H - out_ch) // 2
+        y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
 
-        # micro jitter
-        jx = random.randint(-2, 2)
-        jy = random.randint(-2, 2)
-        x0j = clamp(x0 + jx, 0, CANVAS_W - out_cw)
-        y0j = clamp(y0 + jy, 0, CANVAS_H - out_ch)
+        # --- background video: same crop, scaled higher to cover canvas ---
+        bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
+        bg_w = int(round(bbox.w * bg_scale))
+        bg_h = int(round(bbox.h * bg_scale))
 
-        # Font path (prefer bundled GoogleSans, fallback to DejaVu)
-        font_candidates = [
-            os.environ.get("FONTFILE", ""),
-            "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
-            "./GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-        fontfile = resolve_font_path(font_candidates)
+        # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
+        top_gap = 5
+        space_above = max(10, y0 - top_gap)
+        top_box_w = int(round(CANVAS_W * 0.82))
+        fit = fit_text_top(
+            caption,
+            fontfile,
+            max_w=top_box_w,
+            max_h=space_above,
+            max_font=96,
+            min_font=34,
+            line_spacing=1.15,
+            max_lines=3,
+        )
+        y_block = (y0 - top_gap) - fit.text_h
+        if y_block < 0:
+            y_block = 0
+
+        line_xs = []
+        for lw in fit.line_ws:
+            line_xs.append(max(0, (CANVAS_W - lw) // 2))
+        line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
+
+        # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
+        cta_text = "Siga @SuperEmAlta"
+        cta_font_size = 48
+        font_obj = ImageFont.truetype(fontfile, cta_font_size)
+        bb = font_obj.getbbox(cta_text)
+        cta_w = bb[2] - bb[0]
+        cta_h = bb[3] - bb[1]
+        cta_gap = 40
+        y_cta = y0 + out_ch + cta_gap
+        if y_cta + cta_h > CANVAS_H:
+            y_cta = max(0, CANVAS_H - cta_h)
+        x_cta = max(0, (CANVAS_W - cta_w) // 2)
+
+        # --- ffmpeg filter_complex ---
         font_ff = escape_filter_path(fontfile)
 
-        # Build texts
-        caption_text = line1 + ("\n" + line2 if line2 else "")
-        caption_esc = ff_escape_text(caption_text)
+        # ======================================================
+        # Anti-fingerprint micro-variations (imperceptible)
+        # ======================================================
+        try:
+            random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
+        except Exception:
+            pass
 
-        cta_esc = ff_escape_text(cta) if cta else ""
-        x_cta = int(request.form.get("cta_x", "60") or "60")
-        y_cta = int(request.form.get("cta_y", "1550") or "1550")
+        # Jitter do foreground (mantém)
+        jx = random.randint(-2, 2)
+        jy = random.randint(-2, 2)
+        x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
+        y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
-        # Caption position
-        caption_font_size = int(request.form.get("caption_font_size", "64") or "64")
-        caption_y = int(request.form.get("caption_y", "1490") or "1490")
+        # Tiny audio tempo shift (mantém)
+        atempo = random.choice([0.99, 1.0, 1.01])
 
-        # =======================
-        # FILTER GRAPH (FAST BG)
-        # =======================
-        fc = f"[0:v]split=2[vbgsrc][vfgsrc];"
+        # Blur do fundo (leve/médio) + opacidade 35%
+        # Stroke preto ~4px nos textos via borderw=4
+        fc = ""
 
-        # Background: blur at half-res then upscale (MUCH faster)
         fc += (
-            f"[vbgsrc]"
+            f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
-            f"scale={CANVAS_W}:{CANVAS_H}:flags=bicubic,"
-            f"scale=540:960:flags=bicubic,"
-            f"gblur=sigma=12,"
-            f"scale={CANVAS_W}:{CANVAS_H}:flags=bicubic,"
+            f"scale={bg_w}:{bg_h}:flags=lanczos,"
+            f"crop={CANVAS_W}:{CANVAS_H}:(in_w-{CANVAS_W})/2:(in_h-{CANVAS_H})/2,"
+            f"gblur=sigma=18,"
             f"format=rgba,"
             f"colorchannelmixer=aa=0.35"
             f"[bg];"
         )
 
         fc += (
-            f"[vfgsrc]"
+            f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1,setdar=9/16,"
@@ -499,32 +490,27 @@ def render_binary():
         fc += f"[bg][fg]overlay=0:0[v0];"
 
         v_in = "v0"
-
-        # Caption
-        if caption_esc:
+        for i, ln in enumerate(fit.lines):
+            ln_esc = ff_escape_text(ln)
+            v_out = f"vt{i}"
             fc += (
-                f"[{v_in}]drawtext=fontfile='{font_ff}':text='{caption_esc}':"
-                f"fontsize={caption_font_size}:x=(w-text_w)/2:y={caption_y}:"
+                f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
+                f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
                 f"fontcolor=white:"
                 f"bordercolor=black:borderw=4:"
-                f"line_spacing=10:"
-                f"box=0"
-                f"[v1];"
+                f"box=0[{v_out}];"
             )
-            v_in = "v1"
+            v_in = v_out
 
-        # CTA
-        if cta_esc:
-            fc += (
-                f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
-                f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
-                f"fontcolor=white:"
-                f"bordercolor=black:borderw=4:"
-                f"box=0,"
-                f"fps=30[vout]"
-            )
-        else:
-            fc += f"[{v_in}]fps=30[vout]"
+        cta_esc = ff_escape_text(cta_text)
+        fc += (
+            f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
+            f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
+            f"fontcolor=white:"
+            f"bordercolor=black:borderw=4:"
+            f"box=0,"
+            f"fps=30[vout]"
+        )
 
         app.logger.info("[render_binary] running ffmpeg")
         cmd = [
@@ -535,7 +521,7 @@ def render_binary():
             "-map", "[vout]",
             "-map", "0:a?",
             "-af", f"atempo={atempo},volume=1.02",
-            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
             "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
@@ -543,23 +529,15 @@ def render_binary():
             out_path
         ]
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
 
         # fallback 1: se falhar, tenta SEM -ss
         if r.returncode != 0 or not os.path.exists(out_path):
             if "-ss" in cmd:
-                cmd2 = []
-                skip_next = False
-                for tok in cmd:
-                    if skip_next:
-                        skip_next = False
-                        continue
-                    if tok == "-ss":
-                        skip_next = True
-                        continue
-                    cmd2.append(tok)
-                app.logger.warning("[render_binary] ffmpeg failed w/ -ss, retrying without -ss")
-                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+                cmd2 = cmd.copy()
+                i = cmd2.index("-ss")
+                del cmd2[i:i+2]
+                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
 
         # fallback 2: se falhar, tenta SEM áudio (remove -map 0:a? e -af e setar -an)
         if r.returncode != 0 or not os.path.exists(out_path):
@@ -580,13 +558,12 @@ def render_binary():
                     continue
                 cmd3.append(tok)
             if "-an" not in cmd3:
-                cmd3.insert(cmd3.index(out_path), "-an")
-            app.logger.warning("[render_binary] ffmpeg failed w/ audio, retrying without audio")
-            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+                cmd3.insert(cmd3.index("-c:v"), "-an")
+            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
 
         if r.returncode != 0 or not os.path.exists(out_path):
             app.logger.error("[render_binary] ffmpeg FAILED")
-            app.logger.error((r.stderr or "")[-2000:])
+            app.logger.error((r.stderr or "")[-1200:])
             return jsonify({
                 "error": "ffmpeg failed",
                 "stderr_tail": (r.stderr or "")[-2000:]
@@ -609,13 +586,6 @@ def render_binary():
         return jsonify({"error": "render exception", "details": str(e)[:2000]}), 500
 
     finally:
-        # release queue lock
-        if 'lock_f' in locals() and lock_f is not None:
-            release_render_lock(lock_f)
-
-        # cleanup tmp dir
-        if 'tmp_dir' not in locals() or not tmp_dir:
-            pass
         try:
             for fn in os.listdir(tmp_dir):
                 try:
