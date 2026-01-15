@@ -8,8 +8,8 @@ import subprocess
 import urllib.request
 import base64
 import json
-import math
 import random
+import math
 
 app = Flask(__name__)
 
@@ -24,6 +24,14 @@ def root():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
+# ======================================================
+# /ping (alias)
+# ======================================================
+@app.get("/ping")
+def ping():
+    return jsonify({"ok": True})
+
 
 
 # ======================================================
@@ -399,10 +407,10 @@ def render_binary():
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
         out_cw = int(math.floor(bbox.w * scale))
         out_ch = int(math.floor(bbox.h * scale))
-        out_cw = min(CANVAS_W, max(2, out_cw))
-        out_ch = min(CANVAS_H, max(2, out_ch))
-        if out_cw % 2: out_cw -= 1
-        if out_ch % 2: out_ch -= 1
+        out_cw = min(out_cw, CANVAS_W)
+        out_ch = min(out_ch, CANVAS_H)
+        if out_cw % 2 == 1: out_cw -= 1
+        if out_ch % 2 == 1: out_ch -= 1
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2  # top of cropped inside canvas
 
@@ -410,12 +418,14 @@ def render_binary():
         bg_scale = max(CANVAS_W / bbox.w, CANVAS_H / bbox.h)  # cover (fill)
         bg_w = int(math.ceil(bbox.w * bg_scale))
         bg_h = int(math.ceil(bbox.h * bg_scale))
-        bg_w = max(CANVAS_W, bg_w)
-        bg_h = max(CANVAS_H, bg_h)
-        if bg_w % 2: bg_w += 1
-        if bg_h % 2: bg_h += 1
-        bg_crop_x = max(0, (bg_w - CANVAS_W) // 2)
-        bg_crop_y = max(0, (bg_h - CANVAS_H) // 2)
+        # garante que o background nunca fica menor que o canvas (evita necessidade de pad)
+        bg_w = max(bg_w, CANVAS_W)
+        bg_h = max(bg_h, CANVAS_H)
+        # x264 gosta de dimensões pares
+        if bg_w % 2 == 1: bg_w += 1
+        if bg_h % 2 == 1: bg_h += 1
+        bg_crop_x = max((bg_w - CANVAS_W) // 2, 0)
+        bg_crop_y = max((bg_h - CANVAS_H) // 2, 0)
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 5
@@ -492,12 +502,13 @@ def render_binary():
             f"[bg];"
         )
 
-        # Foreground/main: crop -> scale fit -> format -> overlay on bg (no pad) -> noise
+        # Foreground/main: crop -> scale fit -> pad (transparent) -> overlay on bg -> noise
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1,setdar=9/16,"
+            
             f"format=rgba"
             f"[fgraw];"
         )
