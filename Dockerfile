@@ -17,4 +17,4 @@ ENV PORT=10000
 EXPOSE 10000
 
 # /render pode demorar mais que 30s
-CMD ["gunicorn", "--workers", "1", "--threads", "1", "--timeout", "900", "-b", "0.0.0.0:10000", "app:app"]
+CMD ["gunicorn", "--timeout", "180", "-b", "0.0.0.0:10000", "app:app"]
