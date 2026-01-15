@@ -492,18 +492,17 @@ def render_binary():
             f"[bg];"
         )
 
-        # Foreground/main: crop -> scale fit -> pad (transparent) -> overlay on bg -> noise
+        # Foreground/main: crop -> scale fit -> format -> overlay on bg (no pad) -> noise
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1,setdar=9/16,"
-            f"pad={CANVAS_W}:{CANVAS_H}:{x0j}:{y0j}:color=black@0,"
             f"format=rgba"
-            f"[fg];"
+            f"[fgraw];"
         )
 
-        fc += f"[bg][fg]overlay=0:0,noise=alls=2:allf=t[v0];"
+        fc += f"[bg][fgraw]overlay={x0j}:{y0j}:format=auto,noise=alls=2:allf=t[v0];"
 
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
