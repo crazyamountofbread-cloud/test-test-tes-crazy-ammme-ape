@@ -62,6 +62,7 @@ def render_binary():
     caption_esc = ff_escape_text(caption)
 
     # ---- FILTER GRAPH (SAME EDIT STRUCTURE) ----
+    print("FILTER GRAPH SAME EDIT STRUCTURE")
     fc = (
         f"[0:v]split=2[vbg][vfg];"
         f"[vbg]"
@@ -76,7 +77,7 @@ def render_binary():
         f"[fg];"
         f"[bg][fg]overlay=0:0"
     )
-
+    print("MEXENDO COM FONTE")
     if caption_esc:
         fc += (
             f",drawtext=text='{caption_esc}':"
@@ -87,6 +88,8 @@ def render_binary():
         )
 
     fc += ",fps=30[vout]"
+
+    print("CONFIGURANDO FFMPEG")
 
     # ---- FFMPEG ----
     cmd = [
@@ -104,7 +107,7 @@ def render_binary():
         "-b:a", "192k",
         out_path
     ]
-
+    print("COMECA SUBPROCESS")
     r = subprocess.run(cmd, capture_output=True, text=True)
 
     if r.returncode != 0 or not os.path.exists(out_path):
