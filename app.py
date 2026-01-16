@@ -347,13 +347,7 @@ def render_binary():
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     fontfile = resolve_font_path(font_candidates)
-
-    logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
-
-    if not os.path.exists(fontfile):
-        app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
-        return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
-
+    # Logo removed (no overlay)
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
@@ -428,7 +422,7 @@ def render_binary():
         for lw in fit.line_ws:
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
-        # --- LOGO removed (no overlay) ---
+        # --- LOGO removed ---
 
         # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
         cta_text = "Siga @SuperEmAlta"
@@ -442,83 +436,85 @@ def render_binary():
         if y_cta + cta_h > CANVAS_H:
             y_cta = max(0, CANVAS_H - cta_h)
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
-
-        # --- ffmpeg filter_complex (new motor) ---
+        # --- ffmpeg filter_complex (bg duplicate fill + blur, no logo, stroke on both texts) ---
         font_ff = escape_filter_path(fontfile)
 
         # ======================================================
         # Anti-fingerprint micro-variations (imperceptible)
         # ======================================================
-        # Use stable randomness per video id (optional) to make runs reproducible.
         try:
             random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
         except Exception:
             pass
 
-        # 1) Jitter in pad position (keep inside canvas)
+        # Jitter overlay position (keeps inside canvas)
         jx = random.randint(-2, 2)
         jy = random.randint(-2, 2)
         x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
-        # 2) Tiny noise to alter frame hash (still looks identical)
-        noise_strength = random.choice([1, 2, 3])  # very subtle
-
-        # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
+        # Tiny audio tempo shift to avoid audio fingerprint duplication
         atempo = random.choice([0.99, 1.0, 1.01])
 
-        # --- background settings ---
-        blur_sigma = float(os.environ.get("BG_BLUR", "12"))  # leve/medio
+        # Background blur strength (env override)
+        bg_blur = int(os.environ.get("BG_BLUR", "12"))
+        bg_blur = max(2, min(bg_blur, 40))
 
-        fc = ""
-        fc += (
+        # Build filter graph safely (avoid missing labels)
+        fc_parts = []
+
+        # Crop to detected content once, then split to fg/bg
+        fc_parts.append(
             f"[0:v]"
-            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
-            f"split=2[fgsrc][bgsrc];"
+            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},setsar=1"
+            f"[c]"
         )
+        fc_parts.append("[c]split=2[fg_in][bg_in]")
 
-        # Background: same cropped video, scaled to FILL 9:16 and then cropped (no pad), with blur.
-        fc += (
-            f"[bgsrc]"
-            f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase:flags=lanczos,"
+        # Background: fill canvas + crop + blur (NO padding)
+        fc_parts.append(
+            f"[bg_in]"
+            f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase:flags=bicubic,"
             f"crop={CANVAS_W}:{CANVAS_H},"
-            f"gblur=sigma={blur_sigma}:steps=2"
-            f"[bg];"
+            f"boxblur=luma_radius={bg_blur}:luma_power=1"
+            f"[bg]"
         )
 
-        # Foreground: scaled to FIT inside 9:16 (no pad), with tiny noise.
-        fc += (
-            f"[fgsrc]"
-            f"scale={out_cw}:{out_ch}:flags=lanczos,"
-            f"setsar=1,"
-            f"noise=alls=2:allf=t"
-            f"[fg];"
+        # Foreground: scale to fit inside canvas (already computed)
+        fc_parts.append(
+            f"[fg_in]"
+            f"scale={out_cw}:{out_ch}:flags=lanczos"
+            f"[fg]"
         )
 
-        # Composite
-        fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
+        # Composite: fg on top of blurred bg
+        fc_parts.append(f"[bg][fg]overlay={x0j}:{y0j}[base]")
 
-        v_in = "v0"
+        # Top caption (stroke 4px)
+        v_in = "base"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
             v_out = f"vt{i}"
-            fc += (
+            fc_parts.append(
                 f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
                 f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
-                f"fontcolor=white:borderw=4:bordercolor=black[{v_out}];"
+                f"fontcolor=white:borderw=4:bordercolor=black"
+                f"[{v_out}]"
             )
             v_in = v_out
 
+        # Bottom CTA (stroke 4px) + finalize fps
         cta_esc = ff_escape_text(cta_text)
-        fc += (
+        fc_parts.append(
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
             f"fontcolor=white:borderw=4:bordercolor=black,"
             f"fps=30[vout]"
         )
 
+        fc = ";".join(fc_parts)
 
-        app.logger.info("[render_binary] running ffmpeg (new motor)")
+        app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
@@ -534,6 +530,8 @@ def render_binary():
             "-aspect", "9:16",
             out_path
         ]
+
+
 
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
 
