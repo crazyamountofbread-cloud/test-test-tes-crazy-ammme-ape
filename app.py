@@ -86,6 +86,7 @@ def sanitize_caption(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("'", "’")
     s = s.replace('"', "”")
+    
 
     out = []
     for ch in s:
@@ -398,7 +399,7 @@ def render_binary():
         bbox.h = max(1, min(bbox.h, src_h - bbox.y))
 
         # --- fixed 9:16 canvas ---
-        CANVAS_W, CANVAS_H = 1080, 1920
+        CANVAS_W, CANVAS_H = 720, 1280
 
         # Foreground: scale cropped to fit canvas
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
@@ -466,11 +467,21 @@ def render_binary():
         # 3) Tiny audio tempo shift
         atempo = random.choice([0.99, 1.0, 1.01])
 
-        # Background + Foreground with split=2 (CRITICO)
+        # Background + Foreground: ambos derivados do MESMO crop (bbox)
         fc = ""
-        fc += f"[0:v]split=2[vbgsrc][vfgsrc];"
-
-        # BG chain (fill + crop + blur)
+        
+        # 1) Corta primeiro pelo bbox (isso garante que BG e FG partem do mesmo framing)
+        fc += (
+            f"[0:v]"
+            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
+            f"setsar=1"
+            f"[vcrop];"
+        )
+        
+        # 2) Duplica o crop pra virar BG e FG
+        fc += f"[vcrop]split=2[vbgsrc][vfgsrc];"
+        
+        # 3) BG: pega o crop, aumenta pra preencher o canvas (fill) e recorta pro 9:16 + blur
         fc += (
             f"[vbgsrc]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
@@ -478,19 +489,19 @@ def render_binary():
             f"boxblur=luma_radius=10:luma_power=1:chroma_radius=10:chroma_power=1"
             f"[bg];"
         )
-
-        # FG chain (crop detectado + scale fit)
+        
+        # 4) FG: pega o MESMO crop e faz fit (mantém seu comportamento)
         fc += (
             f"[vfgsrc]"
-            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1"
             f"[fg];"
         )
-
+        
+        # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
-
-        # Top text (stroke 4px)
+        
+        # 6) Drawtext top (stroke 4px)
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
@@ -502,8 +513,8 @@ def render_binary():
                 f"[{v_out}];"
             )
             v_in = v_out
-
-        # CTA (stroke 4px) + noise + fps -> vout
+        
+        # 7) CTA + noise + fps -> vout
         cta_esc = ff_escape_text(cta_text)
         fc += (
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
