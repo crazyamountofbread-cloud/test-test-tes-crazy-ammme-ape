@@ -407,6 +407,11 @@ def render_binary():
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2
+        
+        # >>> ADD: trim 10px each side on the FINAL foreground (in pixels)
+        FG_TRIM_X = 10
+        out_cw_fg = max(2, out_cw - (FG_TRIM_X * 2))
+
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 15
@@ -435,18 +440,31 @@ def render_binary():
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
 
-        # --- bottom CTA ---
+        # --- CTA (NOW: over the video, near the bottom of the foreground) ---
         cta_text = "Siga @SuperEmAlta"
         cta_font_size = 48
         font_obj = ImageFont.truetype(fontfile, cta_font_size)
         bb = font_obj.getbbox(cta_text)
         cta_w = bb[2] - bb[0]
         cta_h = bb[3] - bb[1]
-        cta_gap = 40
-        y_cta = y0 + out_ch + cta_gap
-        if y_cta + cta_h > CANVAS_H:
-            y_cta = max(0, CANVAS_H - cta_h)
+        
+        CTA_PAD_X = 28
+        CTA_PAD_Y = 14
+        CTA_BOTTOM_PAD = 18  # distance from the bottom edge of the FG video
+        
+        # position relative to the foreground (use non-jittered y0 here; jitter is applied in overlay anyway)
+        y_cta = y0 + out_ch - cta_h - CTA_BOTTOM_PAD
+        if y_cta < 0:
+            y_cta = 0
+        
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
+        
+        # CTA background box (black 50%)
+        box_w = cta_w + (CTA_PAD_X * 2)
+        box_h = cta_h + (CTA_PAD_Y * 2)
+        x_box = max(0, (CANVAS_W - box_w) // 2)
+        y_box = max(0, y_cta - CTA_PAD_Y)
+
 
         # --- ffmpeg filter_complex ---
         font_ff = escape_filter_path(fontfile)
@@ -462,7 +480,7 @@ def render_binary():
         # 1) Jitter in positions
         jx = random.randint(-2, 2)
         jy = random.randint(-2, 2)
-        x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
+        x0j = max(0, min(CANVAS_W - out_cw_fg, (x0 + jx) + FG_TRIM_X))
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
         # 2) Tiny noise
@@ -498,6 +516,7 @@ def render_binary():
         fc += (
             f"[vfgsrc]"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
+            f"crop={out_cw_fg}:{out_ch}:{FG_TRIM_X}:0,"
             f"setsar=1"
             f"[fg];"
         )
@@ -521,12 +540,15 @@ def render_binary():
         # 7) CTA + noise + fps -> vout
         cta_esc = ff_escape_text(cta_text)
         fc += (
-            f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
+            f"[{v_in}]"
+            f"drawbox=x={x_box}:y={y_box}:w={box_w}:h={box_h}:color=black@0.5:t=fill,"
+            f"drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
             f"fontcolor=white:borderw=4:bordercolor=black,"
             f"noise=alls={noise_strength}:allf=t,"
             f"fps=30[vout]"
         )
+
 
         app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
