@@ -528,6 +528,10 @@ def render_binary():
             out_path
         ]
 
+        app.logger.error("[render_binary] FILTER_COMPLEX ↓↓↓\n" + fc)
+        app.logger.error("[render_binary] CMD ↓↓↓\n" + " ".join(cmd))
+
+
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
 
         # fallback 1: se falhar, tenta SEM -ss
@@ -558,11 +562,12 @@ def render_binary():
                 cmd3.append(tok)
             if "-an" not in cmd3:
                 cmd3.insert(cmd3.index("-c:v"), "-an")
+                
             r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
 
         if r.returncode != 0 or not os.path.exists(out_path):
             app.logger.error("[render_binary] ffmpeg FAILED")
-            app.logger.error((r.stderr or "")[-1200:])
+            app.logger.error((r.stderr or "")[-8000:])
             return jsonify({
                 "error": "ffmpeg failed",
                 "stderr_tail": (r.stderr or "")[-2000:]
