@@ -14,6 +14,7 @@ import random
 
 
 app = Flask(__name__)
+APP_VERSION = 'bgblur-stroke-nologo-v2'
 @app.get("/")
 def root():
     return jsonify({"ok": True})
@@ -24,7 +25,7 @@ def root():
 # ======================================================
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 # ======================================================
@@ -347,11 +348,12 @@ def render_binary():
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     fontfile = resolve_font_path(font_candidates)
-    # logo removed
+    # LOGO REMOVED
 
     if not os.path.exists(fontfile):
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
         return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
+
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
@@ -442,37 +444,15 @@ def render_binary():
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
 
         
-        # --- ffmpeg filter_complex (bg duplicated + fill + crop + blur, no logo, stroke 4px) ---
+        # --- ffmpeg filter_complex (bg duplicate fill+crop+blur, NO pad, stroke 4px, NO logo) ---
         font_ff = escape_filter_path(fontfile)
 
-        # ======================================================
-        # Anti-fingerprint micro-variations (imperceptible)
-        # ======================================================
-        try:
-            random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
-        except Exception:
-            pass
-
-        # 1) Jitter overlay position (keep inside canvas)
-        jx = random.randint(-2, 2)
-        jy = random.randint(-2, 2)
-        x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
-        y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
-
-        # 2) Tiny noise to alter frame hash (still looks identical)
-        noise_strength = random.choice([1, 2, 3])  # very subtle
-
-        # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
-        atempo = random.choice([0.99, 1.0, 1.01])
-
-        # Background blur strength
         bg_blur = int(os.environ.get("BG_BLUR", "12"))
         bg_blur = max(2, min(bg_blur, 40))
 
-        # Build filter graph (guarantee [vout])
         fc_parts = []
 
-        # Crop to content area once, then split for fg/bg
+        # Crop to detected content once, then split to fg/bg
         fc_parts.append(
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
@@ -481,7 +461,7 @@ def render_binary():
         )
         fc_parts.append("[c]split=2[fg_in][bg_in]")
 
-        # Background: fill canvas (increase), crop exact 9:16, blur
+        # Background: fill canvas, crop, blur (no padding)
         fc_parts.append(
             f"[bg_in]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase:flags=bicubic,"
@@ -490,21 +470,15 @@ def render_binary():
             f"[bg]"
         )
 
-        # Foreground: scale to fit inside canvas (precomputed)
+        # Foreground: scale to fit inside canvas (precomputed out_cw/out_ch)
         fc_parts.append(
             f"[fg_in]"
             f"scale={out_cw}:{out_ch}:flags=lanczos"
             f"[fg]"
         )
 
-        # Composite: fg on bg
-        fc_parts.append(f"[bg][fg]overlay={x0j}:{y0j}[base]")
-
-        # Apply subtle noise AFTER composite
-        fc_parts.append(
-            f"[base]noise=alls={noise_strength}:allf=t"
-            f"[v0]"
-        )
+        # Composite fg over bg
+        fc_parts.append(f"[bg][fg]overlay={x0}:{y0}[v0]")
 
         # Top caption (stroke 4px)
         v_in = "v0"
@@ -519,7 +493,7 @@ def render_binary():
             )
             v_in = v_out
 
-        # Bottom CTA (stroke 4px) + finalize
+        # Bottom CTA (stroke 4px) + output label
         cta_esc = ff_escape_text(cta_text)
         fc_parts.append(
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
@@ -530,14 +504,16 @@ def render_binary():
 
         fc = ";".join(fc_parts)
 
-        # Debug: confirms graph produces vout
-        app.logger.info(f"[render_binary] fc_has_vout={'[vout]' in fc} fc_len={len(fc)}")
-        app.logger.info("[render_binary] running ffmpeg (bg blur, no logo)")
+        if "[vout]" not in fc:
+            app.logger.error("[render_binary] INTERNAL: filtergraph missing [vout]")
+            return jsonify({"error": "internal filtergraph missing vout"}), 500
+
+        app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
             "-i", in_path,
-                        "-filter_complex", fc,
+            "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
             "-af", f"atempo={atempo},volume=1.02",
