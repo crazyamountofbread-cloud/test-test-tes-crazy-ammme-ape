@@ -354,10 +354,6 @@ def render_binary():
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
         return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
 
-    if not os.path.exists(logo_path):
-        app.logger.error(f"[render_binary] logo missing: {logo_path}")
-        return jsonify({"error": "missing Logo.png on server", "path": logo_path}), 500
-
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
@@ -432,21 +428,7 @@ def render_binary():
         for lw in fit.line_ws:
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
-
-        # --- LOGO between top edge and top text block ---
-        logo_w, logo_h = ffprobe_dims(logo_path)
-        avail_logo_h = y_block
-        max_logo_w = int(CANVAS_W * 0.35)
-        max_logo_h = int(avail_logo_h * 0.80) if avail_logo_h > 0 else 0
-        logo_scale = 1.0
-        if max_logo_w > 0 and max_logo_h > 0:
-            logo_scale = min(max_logo_w / logo_w, max_logo_h / logo_h, 1.0)
-        logo_out_w = max(1, int(round(logo_w * logo_scale)))
-        logo_out_h = max(1, int(round(logo_h * logo_scale)))
-        x_logo = (CANVAS_W - logo_out_w) // 2
-        y_logo = (y_block - logo_out_h) // 2
-        if y_logo < 0:
-            y_logo = 0
+        # --- LOGO removed (no overlay) ---
 
         # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
         cta_text = "Siga @SuperEmAlta"
@@ -485,21 +467,36 @@ def render_binary():
         # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
         atempo = random.choice([0.99, 1.0, 1.01])
 
+        # --- background settings ---
+        blur_sigma = float(os.environ.get("BG_BLUR", "12"))  # leve/medio
 
         fc = ""
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
-            f"scale={out_cw}:{out_ch}:flags=lanczos,"
-            f"setsar=1,setdar=9/16,"
-            f"pad={CANVAS_W}:{CANVAS_H}:{x0j}:{y0j}:black,"
-            f"setsar=1,setdar=9/16,"
-            f"noise=alls=2:allf=t"
-            f"[base];"
+            f"split=2[fgsrc][bgsrc];"
         )
 
-        fc += f"[1:v]scale={logo_out_w}:{logo_out_h}[logo];"
-        fc += f"[base][logo]overlay={x_logo}:{y_logo}[v0];"
+        # Background: same cropped video, scaled to FILL 9:16 and then cropped (no pad), with blur.
+        fc += (
+            f"[bgsrc]"
+            f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={CANVAS_W}:{CANVAS_H},"
+            f"gblur=sigma={blur_sigma}:steps=2"
+            f"[bg];"
+        )
+
+        # Foreground: scaled to FIT inside 9:16 (no pad), with tiny noise.
+        fc += (
+            f"[fgsrc]"
+            f"scale={out_cw}:{out_ch}:flags=lanczos,"
+            f"setsar=1,"
+            f"noise=alls=2:allf=t"
+            f"[fg];"
+        )
+
+        # Composite
+        fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
 
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
@@ -508,7 +505,7 @@ def render_binary():
             fc += (
                 f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
                 f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
-                f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28[{v_out}];"
+                f"fontcolor=white:borderw=4:bordercolor=black[{v_out}];"
             )
             v_in = v_out
 
@@ -516,7 +513,7 @@ def render_binary():
         fc += (
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
-            f"fontcolor=white:box=1:boxcolor=black@0.00:boxborderw=28,"
+            f"fontcolor=white:borderw=4:bordercolor=black,"
             f"fps=30[vout]"
         )
 
@@ -526,7 +523,6 @@ def render_binary():
             "ffmpeg", "-y",
             "-ss", "0.35",
             "-i", in_path,
-            "-i", logo_path,
             "-filter_complex", fc,
             "-map", "[vout]",
             "-map", "0:a?",
