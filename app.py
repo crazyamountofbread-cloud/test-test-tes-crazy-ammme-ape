@@ -447,7 +447,6 @@ def render_binary():
         # ======================================================
         # Anti-fingerprint micro-variations (imperceptible)
         # ======================================================
-        # Use stable randomness per video id (optional) to make runs reproducible.
         try:
             random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
         except Exception:
@@ -467,13 +466,12 @@ def render_binary():
 
         # Background: dup do video, fill 9:16 (scale + crop) + blur leve/medio
         # (sem pad; tudo fica dentro de 1080x1920)
-        blur_sigma = 10  # leve/medio (ajusta 8-14 se quiser)
         fc = ""
         fc += (
             f"[0:v]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
             f"crop={CANVAS_W}:{CANVAS_H},"
-            f"boxblur=luma_radius=min(h\\,w)/20:luma_power=1:chroma_radius=min(cw\\,ch)/20:chroma_power=1"
+            f"boxblur=luma_radius=10:luma_power=1:chroma_radius=10:chroma_power=1"
             f"[bg];"
         )
 
