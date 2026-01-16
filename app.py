@@ -53,11 +53,6 @@ def still():
     tmp_dir = tempfile.mkdtemp(prefix="still_")
     out_path = os.path.join(tmp_dir, "still.jpg")
 
-            # Audio tempo (default 1.0)
-        atempo = float(os.environ.get('ATEMPO', '1.0'))
-        if atempo <= 0:
-            atempo = 1.0
-
 cmd = [
         "ffmpeg",
         "-y",
@@ -514,6 +509,11 @@ def render_binary():
             return jsonify({"error": "internal filtergraph missing vout"}), 500
 
         app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
+        # Audio tempo (default 1.0)
+        atempo = float(os.environ.get('ATEMPO', '1.0'))
+        if atempo <= 0:
+            atempo = 1.0
+
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
