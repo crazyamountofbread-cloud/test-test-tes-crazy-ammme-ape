@@ -417,7 +417,7 @@ def render_binary():
             fontfile,
             max_w=top_box_w,
             max_h=space_above,
-            max_font=84,      # menor
+            max_font=58,      # menor
             min_font=28,      # menor
             line_spacing=1.06,# menos distancia entre linhas
             max_lines=3,
