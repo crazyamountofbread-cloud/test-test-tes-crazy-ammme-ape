@@ -409,7 +409,7 @@ def render_binary():
         y0 = (CANVAS_H - out_ch) // 2
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
-        top_gap = 5
+        top_gap = 15
         space_above = max(10, y0 - top_gap)
         top_box_w = int(round(CANVAS_W * 0.82))
         fit = fit_text_top(
@@ -417,14 +417,18 @@ def render_binary():
             fontfile,
             max_w=top_box_w,
             max_h=space_above,
-            max_font=96,
-            min_font=34,
-            line_spacing=1.15,
+            max_font=84,      # menor
+            min_font=28,      # menor
+            line_spacing=1.06,# menos distancia entre linhas
             max_lines=3,
         )
+
+        
+        TOP_MARGIN = 28  # espaço obrigatório no topo
         y_block = (y0 - top_gap) - fit.text_h
-        if y_block < 0:
-            y_block = 0
+        if y_block < TOP_MARGIN:
+            y_block = TOP_MARGIN
+
 
         line_xs = []
         for lw in fit.line_ws:
