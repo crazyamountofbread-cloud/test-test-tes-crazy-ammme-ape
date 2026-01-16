@@ -14,7 +14,7 @@ import random
 
 
 app = Flask(__name__)
-APP_VERSION = 'bgblur-stroke-nologo-v2'
+APP_VERSION = 'bgblur-stroke-nologo-clean'
 @app.get("/")
 def root():
     return jsonify({"ok": True})
@@ -53,7 +53,7 @@ def still():
     tmp_dir = tempfile.mkdtemp(prefix="still_")
     out_path = os.path.join(tmp_dir, "still.jpg")
 
-cmd = [
+    cmd = [
         "ffmpeg",
         "-y",
         "-ss", "0.2",
@@ -348,7 +348,7 @@ def render_binary():
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     fontfile = resolve_font_path(font_candidates)
-    # LOGO REMOVED
+    # logo removed
 
     if not os.path.exists(fontfile):
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
@@ -447,6 +447,12 @@ def render_binary():
         # --- ffmpeg filter_complex (bg duplicate fill+crop+blur, NO pad, stroke 4px, NO logo) ---
         font_ff = escape_filter_path(fontfile)
 
+        # Audio tempo (safe default)
+        atempo = float(os.environ.get("ATEMPO", "1.0"))
+        if atempo <= 0:
+            atempo = 1.0
+
+        # Background blur strength
         bg_blur = int(os.environ.get("BG_BLUR", "12"))
         bg_blur = max(2, min(bg_blur, 40))
 
@@ -504,16 +510,7 @@ def render_binary():
 
         fc = ";".join(fc_parts)
 
-        if "[vout]" not in fc:
-            app.logger.error("[render_binary] INTERNAL: filtergraph missing [vout]")
-            return jsonify({"error": "internal filtergraph missing vout"}), 500
-
         app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
-        # Audio tempo (default 1.0)
-        atempo = float(os.environ.get('ATEMPO', '1.0'))
-        if atempo <= 0:
-            atempo = 1.0
-
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
