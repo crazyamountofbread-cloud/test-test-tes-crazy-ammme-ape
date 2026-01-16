@@ -84,6 +84,8 @@ def still():
 def sanitize_caption(s: str) -> str:
     s = s.replace("\r", "").lstrip("\ufeff")
     s = unicodedata.normalize("NFKC", s)
+    s = s.replace("'", "’")
+    s = s.replace('"', "”")
 
     out = []
     for ch in s:
