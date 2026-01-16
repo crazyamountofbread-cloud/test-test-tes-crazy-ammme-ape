@@ -53,7 +53,12 @@ def still():
     tmp_dir = tempfile.mkdtemp(prefix="still_")
     out_path = os.path.join(tmp_dir, "still.jpg")
 
-    cmd = [
+            # Audio tempo (default 1.0)
+        atempo = float(os.environ.get('ATEMPO', '1.0'))
+        if atempo <= 0:
+            atempo = 1.0
+
+cmd = [
         "ffmpeg",
         "-y",
         "-ss", "0.2",
