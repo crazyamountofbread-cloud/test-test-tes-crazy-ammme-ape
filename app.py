@@ -10,11 +10,7 @@ import base64
 import json
 import random
 
-
-
-
 app = Flask(__name__)
-APP_VERSION = 'bgblur-stroke-nologo-clean'
 @app.get("/")
 def root():
     return jsonify({"ok": True})
@@ -25,7 +21,7 @@ def root():
 # ======================================================
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "version": APP_VERSION})
+    return jsonify({"ok": True})
 
 
 # ======================================================
@@ -120,18 +116,10 @@ def make_caption_lines(caption: str, width: int = 28, max_lines: int = 2):
 
 
 def ff_escape_text(s: str) -> str:
-    # Escapes for FFmpeg drawtext inside single quotes.
-    # Conservative: escape chars that can break filtergraph parsing.
-    s = s.replace('\\', '\\\\')
-    s = s.replace(':', r'\:')
+    s = s.replace("\\", "\\\\")
+    s = s.replace(":", r"\:")
     s = s.replace("'", r"\'")
-    s = s.replace('%', r'\%')
-    s = s.replace(',', r'\,')
-    s = s.replace(';', r'\;')
-    s = s.replace('[', r'\[')
-    s = s.replace(']', r'\]')
-    s = s.replace('\n', ' ')
-    s = s.replace('\r', ' ')
+    s = s.replace("%", r"\%")
     return s
 
 
@@ -160,6 +148,7 @@ def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
     raise RuntimeError(
         "No usable TTF font found. Provide a static .ttf via FONTFILE env or include one in ./fonts."
     )
+
 import numpy as np
 import cv2
 
@@ -356,7 +345,9 @@ def render_binary():
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     fontfile = resolve_font_path(font_candidates)
-    # logo removed
+
+    # (logo removida do render; mantemos LOGO_PATH só por compat, mas não exigimos arquivo)
+    logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
 
     if not os.path.exists(fontfile):
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
@@ -407,7 +398,7 @@ def render_binary():
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 1080, 1920
 
-        # scale cropped to fit canvas
+        # Foreground: scale cropped to fit canvas (no pad black visible because teremos background)
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
         out_cw = int(round(bbox.w * scale))
         out_ch = int(round(bbox.h * scale))
@@ -436,7 +427,6 @@ def render_binary():
         for lw in fit.line_ws:
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
-        # --- LOGO removed ---
 
         # --- bottom CTA (mantém o mesmo texto, posicionado abaixo do vídeo) ---
         cta_text = "Siga @SuperEmAlta"
@@ -451,84 +441,77 @@ def render_binary():
             y_cta = max(0, CANVAS_H - cta_h)
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
 
-        
-        # --- ffmpeg filter_complex (bg duplicate fill+crop+blur, NO pad, stroke 4px, NO logo) ---
+        # --- ffmpeg filter_complex (new motor) ---
         font_ff = escape_filter_path(fontfile)
 
-        # Audio tempo (safe default)
-        atempo = float(os.environ.get("ATEMPO", "1.0"))
-        if atempo <= 0:
-            atempo = 1.0
+        # ======================================================
+        # Anti-fingerprint micro-variations (imperceptible)
+        # ======================================================
+        # Use stable randomness per video id (optional) to make runs reproducible.
+        try:
+            random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
+        except Exception:
+            pass
 
-        # Background blur strength
-        bg_blur = int(os.environ.get("BG_BLUR", "12"))
-        bg_blur = max(2, min(bg_blur, 40))
+        # 1) Jitter in positions (keep inside canvas)
+        jx = random.randint(-2, 2)
+        jy = random.randint(-2, 2)
+        x0j = max(0, min(CANVAS_W - out_cw, x0 + jx))
+        y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
-        fc_parts = []
+        # 2) Tiny noise to alter frame hash (still looks identical)
+        noise_strength = random.choice([1, 2, 3])  # very subtle
 
-        # Crop to detected content once, then split to fg/bg
-        fc_parts.append(
+        # 3) Tiny audio tempo shift to avoid audio fingerprint duplication
+        atempo = random.choice([0.99, 1.0, 1.01])
+
+        # Background: dup do video, fill 9:16 (scale + crop) + blur leve/medio
+        # (sem pad; tudo fica dentro de 1080x1920)
+        blur_sigma = 10  # leve/medio (ajusta 8-14 se quiser)
+        fc = ""
+        fc += (
+            f"[0:v]"
+            f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
+            f"crop={CANVAS_W}:{CANVAS_H},"
+            f"boxblur=luma_radius=min(h\\,w)/20:luma_power=1:chroma_radius=min(cw\\,ch)/20:chroma_power=1"
+            f"[bg];"
+        )
+
+        # Foreground: crop detectado -> scale fit -> overlay no bg
+        fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
+            f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1"
-            f"[c]"
+            f"[fg];"
         )
-        fc_parts.append("[c]split=2[fg_in][bg_in]")
+        fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
 
-        # Background: fill canvas, crop, blur (no padding)
-        fc_parts.append(
-            f"[bg_in]"
-            f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase:flags=bicubic,"
-            f"crop={CANVAS_W}:{CANVAS_H},"
-            f"boxblur=luma_radius={bg_blur}:luma_power=1"
-            f"[bg]"
-        )
-
-        # Foreground: scale to fit inside canvas (precomputed out_cw/out_ch)
-        fc_parts.append(
-            f"[fg_in]"
-            f"scale={out_cw}:{out_ch}:flags=lanczos"
-            f"[fg]"
-        )
-
-        # Composite fg over bg
-        fc_parts.append(f"[bg][fg]overlay={x0}:{y0}[v0]")
-
-        # Top caption (stroke 4px)
+        # Text stroke 4px (outlinecolor black)
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
             v_out = f"vt{i}"
-            fc_parts.append(
+            fc += (
                 f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
                 f"fontsize={fit.font_size}:x={line_xs[i]}:y={line_ys[i]}:"
-                f"fontcolor=white:borderw=4:bordercolor=black"
-                f"[{v_out}]"
+                f"fontcolor=white:"
+                f"borderw=4:bordercolor=black"
+                f"[{v_out}];"
             )
             v_in = v_out
 
-        # Bottom CTA (stroke 4px) + output label
         cta_esc = ff_escape_text(cta_text)
-        fc_parts.append(
+        fc += (
             f"[{v_in}]drawtext=fontfile='{font_ff}':text='{cta_esc}':"
             f"fontsize={cta_font_size}:x={x_cta}:y={y_cta}:"
-            f"fontcolor=white:borderw=4:bordercolor=black,"
+            f"fontcolor=white:"
+            f"borderw=4:bordercolor=black,"
+            f"noise=alls={noise_strength}:allf=t,"
             f"fps=30[vout]"
         )
 
-        fc = ";".join(fc_parts)
-
-        
-        # Defensive: make sure we actually created the output label we map.
-        if "[vout]" not in fc:
-            app.logger.error("[render_binary] INTERNAL: filtergraph missing [vout]")
-            app.logger.error(f"[render_binary] fc_preview={fc[:400]}")
-            return jsonify({"error": "internal filtergraph missing vout"}), 500
-
-        # Helpful debug (keep short to avoid log spam)
-        app.logger.info(f"[render_binary] fc_len={len(fc)}")
-        app.logger.info(f"[render_binary] fc_tail={fc[-220:]}")
-        app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
+        app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
@@ -554,7 +537,7 @@ def render_binary():
                 i = cmd2.index("-ss")
                 del cmd2[i:i+2]
                 r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
-        
+
         # fallback 2: se falhar, tenta SEM áudio (remove -map 0:a? e -af e setar -an)
         if r.returncode != 0 or not os.path.exists(out_path):
             cmd3 = []
