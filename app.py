@@ -120,10 +120,18 @@ def make_caption_lines(caption: str, width: int = 28, max_lines: int = 2):
 
 
 def ff_escape_text(s: str) -> str:
-    s = s.replace("\\", "\\\\")
-    s = s.replace(":", r"\:")
+    # Escapes for FFmpeg drawtext inside single quotes.
+    # Conservative: escape chars that can break filtergraph parsing.
+    s = s.replace('\\', '\\\\')
+    s = s.replace(':', r'\:')
     s = s.replace("'", r"\'")
-    s = s.replace("%", r"\%")
+    s = s.replace('%', r'\%')
+    s = s.replace(',', r'\,')
+    s = s.replace(';', r'\;')
+    s = s.replace('[', r'\[')
+    s = s.replace(']', r'\]')
+    s = s.replace('\n', ' ')
+    s = s.replace('\r', ' ')
     return s
 
 
@@ -510,6 +518,16 @@ def render_binary():
 
         fc = ";".join(fc_parts)
 
+        
+        # Defensive: make sure we actually created the output label we map.
+        if "[vout]" not in fc:
+            app.logger.error("[render_binary] INTERNAL: filtergraph missing [vout]")
+            app.logger.error(f"[render_binary] fc_preview={fc[:400]}")
+            return jsonify({"error": "internal filtergraph missing vout"}), 500
+
+        # Helpful debug (keep short to avoid log spam)
+        app.logger.info(f"[render_binary] fc_len={len(fc)}")
+        app.logger.info(f"[render_binary] fc_tail={fc[-220:]}")
         app.logger.info("[render_binary] running ffmpeg (bg blur + stroke, no logo)")
         cmd = [
             "ffmpeg", "-y",
