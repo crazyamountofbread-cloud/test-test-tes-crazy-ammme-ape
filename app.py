@@ -465,24 +465,31 @@ def render_binary():
         atempo = random.choice([0.99, 1.0, 1.01])
 
         # Background: dup do video, fill 9:16 (scale + crop) + blur leve/medio
-        # (sem pad; tudo fica dentro de 1080x1920)
+        # Foreground: crop detectado -> scale fit -> overlay no bg
         fc = ""
+
+        # SPLIT: precisamos duplicar [0:v] para usar em 2 cadeias
+        fc += f"[0:v]split=2[vbgsrc][vfgsrc];"
+
+        # BG chain
         fc += (
-            f"[0:v]"
+            f"[vbgsrc]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
             f"crop={CANVAS_W}:{CANVAS_H},"
             f"boxblur=luma_radius=10:luma_power=1:chroma_radius=10:chroma_power=1"
             f"[bg];"
         )
 
-        # Foreground: crop detectado -> scale fit -> overlay no bg
+        # FG chain
         fc += (
-            f"[0:v]"
+            f"[vfgsrc]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
             f"setsar=1"
             f"[fg];"
         )
+
+        # Composite
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
 
         # Text stroke 4px (outlinecolor black)
@@ -508,6 +515,7 @@ def render_binary():
             f"noise=alls={noise_strength}:allf=t,"
             f"fps=30[vout]"
         )
+
 
         app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
