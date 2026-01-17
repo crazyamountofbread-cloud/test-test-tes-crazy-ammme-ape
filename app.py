@@ -86,33 +86,28 @@ def still():
 #NEW:
 def detect_burned_sub_band(img_bgr):
     """
-    Retorna (y1, y2) da legenda burned-in (faixa bem justa), ou None.
-    Agora: procura APENAS no fundo do frame e ignora bordas laterais (moldura).
+    Retorna (y1, y2) da faixa da legenda burned-in (com padding), ou None.
+    Funciona bem com 1 ou 2 linhas.
     """
     h, w = img_bgr.shape[:2]
 
-    # --- procurar só onde legenda de fala normalmente fica (parte de baixo) ---
-    y_start = int(h * 0.60)
-    y_end   = int(h * 0.96)
-    if y_end <= y_start + 10:
+    # procura no terço inferior (onde legenda normalmente fica)
+    y_start = int(h * 0.50)
+    roi = img_bgr[y_start:, :]
+    if roi.size == 0:
         return None
 
-    roi = img_bgr[y_start:y_end, :]
-
-    # ignora as bordas laterais (moldura branca costuma “enganar”)
-    x_margin = int(w * 0.07)  # 7% de cada lado
-    roi_use = roi[:, x_margin:w - x_margin]
-
-    hsv = cv2.cvtColor(roi_use, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     H = hsv[..., 0].astype(np.int16)
     S = hsv[..., 1].astype(np.int16)
     V = hsv[..., 2].astype(np.int16)
 
-    # amarelo + branco (legendas típicas)
-    mask_white  = (V > 215) & (S < 90)
-    mask_yellow = (H >= 15) & (H <= 55) & (S > 70) & (V > 110)
+    # branco + amarelo (comum em subtitle)
+    mask_white  = (V > 210) & (S < 95)
+    mask_yellow = (H >= 12) & (H <= 55) & (S > 60) & (V > 110)
     mask = (mask_white | mask_yellow).astype(np.uint8) * 255
 
+    # morfologia leve
     k = max(3, (min(h, w) // 260) | 1)
     kernel = np.ones((k, k), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -120,97 +115,61 @@ def detect_burned_sub_band(img_bgr):
 
     # densidade por linha
     row = (mask.mean(axis=1) / 255.0)
-    row_s = smooth1d(row, k=max(9, (mask.shape[0] // 50) | 1))
+    row_s = smooth1d(row, k=max(9, (roi.shape[0] // 45) | 1))
 
     peak = float(row_s.max())
-    if peak < 0.010:
+    if peak < 0.008:
         return None
 
-    # threshold relativo ao pico
-    thr = max(0.012, peak * 0.62)
+    thr = max(0.010, peak * 0.55)
     idx = np.where(row_s >= thr)[0]
     if idx.size == 0:
         return None
 
-    # ---- une segmentos fortes perto do fundo (pega 2 linhas) ----
-        d = np.diff(idx)
-        breaks = np.where(d > 1)[0]
-        starts = np.r_[idx[0], idx[breaks + 1]]
-        ends   = np.r_[idx[breaks], idx[-1]]
-        
-        min_len = max(12, mask.shape[0] // 55)
-        
-        # pega os segmentos válidos
-        segs = []
-        for s, e in zip(starts, ends):
-            if int(e - s + 1) >= min_len:
-                segs.append((int(s), int(e)))
-        
-        if not segs:
-            # fallback: usa o segmento mais baixo mesmo que seja curto
-            # (evita y1/y2 indefinidos)
-            anchor = max(list(zip(starts, ends)), key=lambda t: t[1])
-            y1, y2 = int(anchor[0]), int(anchor[1])
-        else:
-            # ancora no mais baixo e une os próximos (cobre 2 linhas)
-            y1, y2 = max(segs, key=lambda t: t[1])
-        
-            MERGE_GAP = max(10, mask.shape[0] // 28)  # tolera espaço entre linhas
-            changed = True
-            while changed:
-                changed = False
-                for s, e in segs:
-                    if e < y1 - MERGE_GAP or s > y2 + MERGE_GAP:
-                        continue
-                    ny1 = min(y1, s)
-                    ny2 = max(y2, e)
-                    if ny1 != y1 or ny2 != y2:
-                        y1, y2 = ny1, ny2
-                        changed = True
-        
-        # padding maior (2 linhas + outline)
-        pad_up = max(10, h // 70)
-        pad_dn = max(12, h // 65)
-        
-        y1g = max(0, y_start + y1 - pad_up)
-        y2g = min(h - 1, y_start + y2 + pad_dn)
-        
-        if (y2g - y1g) < max(28, h // 45):
-            return None
-        
-        return int(y1g), int(y2g)
+    seg = largest_contiguous_segment(idx)
+    if seg is None:
+        return None
 
-        
-        # ancora no mais baixo e une os que estiverem próximos (cobre 2 linhas com gap)
-        anchor = max(segs, key=lambda t: t[1])
-        y1, y2 = anchor
-        
-        MERGE_GAP = max(10, mask.shape[0] // 28)  # tolera espaço entre linhas
-        changed = True
-        while changed:
-            changed = False
-            for s, e in segs:
-                if e < y1 - MERGE_GAP or s > y2 + MERGE_GAP:
-                    continue
-                ny1 = min(y1, s)
-                ny2 = max(y2, e)
-                if ny1 != y1 or ny2 != y2:
-                    y1, y2 = ny1, ny2
-                    changed = True
-        
-        # padding maior (pra pegar 2 linhas + outline/fundo)
-        pad_up = max(10, h // 70)
-        pad_dn = max(12, h // 65)
+    y1, y2 = int(seg[0]), int(seg[1])
 
+    # --- suporte a 2 linhas: junta qualquer outro segmento “perto” ---
+    # (refaz segmentos a partir de idx)
+    d = np.diff(idx)
+    breaks = np.where(d > 1)[0]
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends   = np.r_[idx[breaks], idx[-1]]
+    segs = [(int(s), int(e)) for s, e in zip(starts, ends)]
+
+    MERGE_GAP = max(10, roi.shape[0] // 26)
+    changed = True
+    while changed:
+        changed = False
+        for s, e in segs:
+            if e < y1 - MERGE_GAP or s > y2 + MERGE_GAP:
+                continue
+            ny1 = min(y1, s)
+            ny2 = max(y2, e)
+            if ny1 != y1 or ny2 != y2:
+                y1, y2 = ny1, ny2
+                changed = True
+
+    # rejeita faixa absurda
+    if (y2 - y1) > int(roi.shape[0] * 0.55):
+        return None
+
+    # padding (pra pegar 2 linhas + outline)
+    pad_up = max(12, h // 60)
+    pad_dn = max(14, h // 55)
 
     y1g = max(0, y_start + y1 - pad_up)
     y2g = min(h - 1, y_start + y2 + pad_dn)
 
-    # altura mínima plausível de legenda
-    if (y2g - y1g) < max(22, h // 55):
+    # mínimo de altura
+    if (y2g - y1g) < max(40, h // 35):
         return None
 
     return int(y1g), int(y2g)
+
 
 
 
