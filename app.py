@@ -15,6 +15,84 @@ app = Flask(__name__)
 def root():
     return jsonify({"ok": True})
 
+# ======================================================
+# /mp3  (MP4 upload -> MP3 download)
+# ======================================================
+@app.post("/mp3")
+def mp4_to_mp3():
+    app.logger.info("[mp3] START")
+
+    if "file" in request.files:
+        f = request.files["file"]
+    elif len(request.files) > 0:
+        f = next(iter(request.files.values()))
+    else:
+        return jsonify({"error": "missing file", "files_keys": list(request.files.keys())}), 400
+
+    vid_id = str(request.form.get("id", "audio"))
+    tmp_dir = tempfile.mkdtemp(prefix="mp3_")
+    in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
+    out_path = os.path.join(tmp_dir, f"{vid_id}.mp3")
+
+    try:
+        f.save(in_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-b:a", "192k",
+            "-ar", "44100",
+            out_path
+        ]
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+        # fallback: se libmp3lame não existir no build, tenta mp3 encoder "mp3" (raramente necessário)
+        if (r.returncode != 0 or not os.path.exists(out_path)):
+            cmd2 = [
+                "ffmpeg", "-y",
+                "-i", in_path,
+                "-vn",
+                "-codec:a", "mp3",
+                "-b:a", "192k",
+                "-ar", "44100",
+                out_path
+            ]
+            r = subprocess.run(cmd2, capture_output=True, text=True, timeout=180)
+
+        if r.returncode != 0 or not os.path.exists(out_path):
+            return jsonify({
+                "error": "ffmpeg mp3 failed",
+                "stderr_tail": (r.stderr or "")[-2000:]
+            }), 500
+
+        return send_file(
+            out_path,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name=f"{vid_id}.mp3"
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "ffmpeg timeout"}), 504
+
+    except Exception as e:
+        app.logger.exception("[mp3] EXCEPTION")
+        return jsonify({"error": "mp3 exception", "details": str(e)[:2000]}), 500
+
+    finally:
+        try:
+            for fn in os.listdir(tmp_dir):
+                try:
+                    os.remove(os.path.join(tmp_dir, fn))
+                except:
+                    pass
+            os.rmdir(tmp_dir)
+        except:
+            pass
+
 
 # ======================================================
 # /health
