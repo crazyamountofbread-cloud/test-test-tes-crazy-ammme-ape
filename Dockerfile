@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App + assets
 COPY app.py .
 COPY Logo.png .
+COPY GoogleSans-VariableFont_GRAD,opsz,wght.ttf ./
 COPY fonts ./fonts
 
 ENV PORT=10000
