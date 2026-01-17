@@ -86,37 +86,56 @@ def still():
 #NEW:
 def detect_burned_sub_band(img_bgr):
     """
-    Return (y1, y2) of subtitle band in source coords, or None.
-    Heurística: procura faixa horizontal com muitos edges no terço inferior.
+    Retorna (y1, y2) da faixa de legenda burned-in, ou None.
+    Heurística: detecta pixels de texto (amarelo/branco) no terço inferior.
     """
     h, w = img_bgr.shape[:2]
+
+    # procura mais embaixo (essas legendas ficam bem no bottom)
     y_start = int(h * 0.55)
     roi = img_bgr[y_start:, :]
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    H = hsv[..., 0].astype(np.int16)
+    S = hsv[..., 1].astype(np.int16)
+    V = hsv[..., 2].astype(np.int16)
 
-    edges = cv2.Canny(gray, 60, 160)
-    # densidade de edges por linha
-    row = edges.mean(axis=1)
+    # branco (muito brilho, pouca saturação) + amarelo (H ~ 20-45)
+    mask_white  = (V > 215) & (S < 90)
+    mask_yellow = (H >= 15) & (H <= 45) & (S > 80) & (V > 120)
 
-    row_s = smooth1d(row, k=max(11, (roi.shape[0] // 40) | 1))
-    thr = float(np.max(row_s) * 0.55)
+    mask = (mask_white | mask_yellow).astype(np.uint8) * 255
+
+    # limpa ruído / junta letras
+    k = max(3, (min(h, w) // 260) | 1)
+    kernel = np.ones((k, k), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+
+    # densidade por linha (fração de pixels de "texto")
+    row = (mask.mean(axis=1) / 255.0)
+    row_s = smooth1d(row, k=max(11, (roi.shape[0] // 35) | 1))
+
+    # threshold mais permissivo
+    thr = max(0.010, float(row_s.max()) * 0.35)
     idx = np.where(row_s > thr)[0]
     seg = largest_contiguous_segment(idx)
     if seg is None:
         return None
 
     y1, y2 = seg
-    # engrossa um pouco pra pegar outline/sombra
-    pad = max(8, h // 90)
+
+    # padding pra pegar borda/outline e fundo
+    pad = max(10, h // 80)
     y1 = max(0, y_start + y1 - pad)
     y2 = min(h - 1, y_start + y2 + pad)
 
-    # rejeita faixas muito finas
-    if (y2 - y1) < max(30, h // 18):
+    # rejeita faixas pequenas (evita falso positivo)
+    if (y2 - y1) < max(55, h // 28):
         return None
+
     return int(y1), int(y2)
+
 
 
 def sanitize_caption(s: str) -> str:
@@ -449,13 +468,12 @@ def render_binary():
                 sub_bands.append(band)
         
         sub_y1 = sub_y2 = None
-        if sub_bands:
+        if len(sub_bands) >= 2:  # <<< só considera se detectar em 2+ frames
             ys1 = np.median([b[0] for b in sub_bands])
             ys2 = np.median([b[1] for b in sub_bands])
             sub_y1, sub_y2 = int(ys1), int(ys2)
-
-        # >>> ADD: flag final (fallback automático)
-        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)   
+        
+        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)  
 
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 720, 1280
