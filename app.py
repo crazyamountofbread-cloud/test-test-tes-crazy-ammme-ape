@@ -132,29 +132,44 @@ def detect_burned_sub_band(img_bgr):
     if idx.size == 0:
         return None
 
-    # ---- pega o SEGMENTO mais perto do fundo (não o maior) ----
-    d = np.diff(idx)
-    breaks = np.where(d > 1)[0]
-    starts = np.r_[idx[0], idx[breaks + 1]]
-    ends   = np.r_[idx[breaks], idx[-1]]
+    # ---- une segmentos fortes perto do fundo (pega 2 linhas) ----
+        d = np.diff(idx)
+        breaks = np.where(d > 1)[0]
+        starts = np.r_[idx[0], idx[breaks + 1]]
+        ends   = np.r_[idx[breaks], idx[-1]]
+        
+        min_len = max(12, mask.shape[0] // 55)
+        
+        # pega os segmentos válidos
+        segs = []
+        for s, e in zip(starts, ends):
+            if int(e - s + 1) >= min_len:
+                segs.append((int(s), int(e)))
+        
+        if not segs:
+            return None
+        
+        # ancora no mais baixo e une os que estiverem próximos (cobre 2 linhas com gap)
+        anchor = max(segs, key=lambda t: t[1])
+        y1, y2 = anchor
+        
+        MERGE_GAP = max(10, mask.shape[0] // 28)  # tolera espaço entre linhas
+        changed = True
+        while changed:
+            changed = False
+            for s, e in segs:
+                if e < y1 - MERGE_GAP or s > y2 + MERGE_GAP:
+                    continue
+                ny1 = min(y1, s)
+                ny2 = max(y2, e)
+                if ny1 != y1 or ny2 != y2:
+                    y1, y2 = ny1, ny2
+                    changed = True
+        
+        # padding maior (pra pegar 2 linhas + outline/fundo)
+        pad_up = max(10, h // 70)
+        pad_dn = max(12, h // 65)
 
-    # escolhe o segmento com maior "end" (mais embaixo), com tamanho mínimo
-    best = None
-    for s, e in zip(starts, ends):
-        length = int(e - s + 1)
-        if length < max(18, mask.shape[0] // 40):
-            continue
-        if best is None or e > best[1]:
-            best = (int(s), int(e))
-
-    if best is None:
-        return None
-
-    y1, y2 = best
-
-    # padding pequeno (bem justo)
-    pad_up = 4
-    pad_dn = 6
 
     y1g = max(0, y_start + y1 - pad_up)
     y2g = min(h - 1, y_start + y2 + pad_dn)
