@@ -81,6 +81,44 @@ def still():
 # ======================================================
 # Helpers (render)
 # ======================================================
+
+
+#NEW:
+def detect_burned_sub_band(img_bgr: np.ndarray):
+    """
+    Return (y1, y2) of subtitle band in source coords, or None.
+    Heurística: procura faixa horizontal com muitos edges no terço inferior.
+    """
+    h, w = img_bgr.shape[:2]
+    y_start = int(h * 0.55)
+    roi = img_bgr[y_start:, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5,5), 0)
+
+    edges = cv2.Canny(gray, 60, 160)
+    # densidade de edges por linha
+    row = edges.mean(axis=1)
+
+    row_s = smooth1d(row, k=max(11, (roi.shape[0] // 40) | 1))
+    thr = float(np.max(row_s) * 0.55)
+    idx = np.where(row_s > thr)[0]
+    seg = largest_contiguous_segment(idx)
+    if seg is None:
+        return None
+
+    y1, y2 = seg
+    # engrossa um pouco pra pegar outline/sombra
+    pad = max(8, h // 90)
+    y1 = max(0, y_start + y1 - pad)
+    y2 = min(h - 1, y_start + y2 + pad)
+
+    # rejeita faixas muito finas
+    if (y2 - y1) < max(30, h // 18):
+        return None
+    return int(y1), int(y2)
+
+
 def sanitize_caption(s: str) -> str:
     s = s.replace("\r", "").lstrip("\ufeff")
     s = unicodedata.normalize("NFKC", s)
@@ -398,6 +436,27 @@ def render_binary():
         bbox.w = max(1, min(bbox.w, src_w - bbox.x))
         bbox.h = max(1, min(bbox.h, src_h - bbox.y))
 
+
+        #NEW:
+        # --- detect subtitle band on ORIGINAL (burned-in) ---
+        sub_bands = []
+        for fp in frames:
+            img = cv2.imread(fp, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            band = detect_burned_sub_band(img)
+            if band:
+                sub_bands.append(band)
+        
+        sub_y1 = sub_y2 = None
+        if sub_bands:
+            ys1 = np.median([b[0] for b in sub_bands])
+            ys2 = np.median([b[1] for b in sub_bands])
+            sub_y1, sub_y2 = int(ys1), int(ys2)
+
+        # >>> ADD: flag final (fallback automático)
+        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)   
+
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 720, 1280
 
@@ -407,6 +466,23 @@ def render_binary():
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2
+
+        # --- subtitle overlay placement (canvas coords) ---
+        sub_h_src = None
+        y_sub = None
+        
+        if has_sub:
+            src_w, src_h = ffprobe_dims(in_path)
+            sub_h_src = max(2, sub_y2 - sub_y1)
+        
+            sub_scale = CANVAS_W / src_w
+            sub_h_out = int(round(sub_h_src * sub_scale))
+        
+            SUB_PAD_FROM_FG_BOTTOM = 8
+            y_sub = int(y0j + out_ch - sub_h_out - SUB_PAD_FROM_FG_BOTTOM)
+            if y_sub < 0:
+                y_sub = 0
+
         
         # >>> ADD: trim 10px each side on the FINAL foreground (in pixels)
         FG_TRIM_X = 10
@@ -524,8 +600,23 @@ def render_binary():
         # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
         
-        # 6) Drawtext top (stroke 4px)
-        v_in = "v0"
+        # 5.5) Subtitle band overlay (ONLY if detected)
+        v_start = "v0"
+        if has_sub:
+            fc += (
+                f"[0:v]"
+                f"crop={src_w}:{sub_h_src}:0:{sub_y1},"
+                f"scale={CANVAS_W}:-1:flags=lanczos,"
+                f"setsar=1"
+                f"[sub];"
+            )
+            fc += f"[v0][sub]overlay=0:{y_sub}[v0s];"
+            v_start = "v0s"
+        
+        # 6) Drawtext starts from v_start
+        v_in = v_start
+          
+        #v_in = "v0"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
             v_out = f"vt{i}"
