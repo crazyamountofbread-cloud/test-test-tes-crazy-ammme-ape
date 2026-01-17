@@ -9,6 +9,7 @@ import urllib.request
 import base64
 import json
 import random
+from typing import Optional
 
 app = Flask(__name__)
 @app.get("/")
@@ -205,6 +206,62 @@ def ff_escape_text(s: str) -> str:
 
 
 # ======================================================
+# Timed captions (custom SRT-like blocks)
+# ======================================================
+
+_TIME_RE = re.compile(r"(\d+):(\d+):(\d+)\s*-->\s*(\d+):(\d+):(\d+)")
+
+
+def _t_to_seconds(mm: str, ss: str, ms: str) -> float:
+    return (int(mm) * 60.0) + float(int(ss)) + (int(ms) / 1000.0)
+
+
+def parse_timed_captions(raw: str):
+    """Parse blocks. Accepts both real newlines and literal '\\n'.
+
+    Returns: list of [start, end, text]
+    """
+    if raw is None:
+        return []
+    s = str(raw)
+    if "\\n" in s:
+        s = s.replace("\\n", "\n")
+    s = s.replace("\r", "").lstrip("\ufeff")
+    s = unicodedata.normalize("NFC", s)
+
+    blocks = re.split(r"\n\s*\n", s.strip(), flags=re.MULTILINE)
+    items = []
+    for b in blocks:
+        lines = [ln for ln in b.splitlines() if ln.strip() != ""]
+        if len(lines) < 3:
+            continue
+        m = _TIME_RE.search(lines[1])
+        if not m:
+            continue
+        start = _t_to_seconds(m.group(1), m.group(2), m.group(3))
+        end = _t_to_seconds(m.group(4), m.group(5), m.group(6))
+        txt = "\n".join(lines[2:]).strip()
+        if txt:
+            items.append([start, end, txt])
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def extend_caption_ends_midpoint(items):
+    """For each caption i (except the last):
+    end_i = midpoint(end_i, start_{i+1}) when there is a positive gap.
+    """
+    if not items:
+        return items
+    for i in range(len(items) - 1):
+        end_i = float(items[i][1])
+        start_next = float(items[i + 1][0])
+        if start_next > end_i:
+            items[i][1] = (end_i + start_next) / 2.0
+    return items
+
+
+# ======================================================
 # Helpers (new crop + auto-fit)
 # ======================================================
 
@@ -394,6 +451,228 @@ def fit_text_top(text: str, font_path: str, max_w: int, max_h: int,
 
 
 # ======================================================
+# Timed caption rendering helpers (white box + drawtext)
+# ======================================================
+
+@dataclass
+class TimedCaptionFit:
+    font_size: int
+    lines: list[str]
+    text_h: int
+    line_h: int
+    line_ws: list[int]
+
+
+def wrap_text_keep_newlines(text: str, font: ImageFont.FreeTypeFont, max_w: int):
+    """Wrap, preserving explicit '\n' in the caption text."""
+    text = sanitize_caption(text)
+    parts = text.split("\n")
+    out: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            out.append("")
+            continue
+        out.extend(wrap_text_to_width(part, font, max_w))
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def fit_text_in_box(text: str, font_path: str, max_w: int, max_h: int,
+                    max_font: int = 96, min_font: int = 26,
+                    line_spacing: float = 1.10, max_lines: int = 4) -> TimedCaptionFit:
+    text = unicodedata.normalize("NFC", text or "")
+    for size in range(max_font, min_font - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text_keep_newlines(text, font, max_w)
+        if len(lines) > max_lines:
+            continue
+        text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+        if text_h <= max_h:
+            return TimedCaptionFit(size, lines, text_h, line_h, line_ws)
+
+    font = ImageFont.truetype(font_path, min_font)
+    lines = wrap_text_keep_newlines(text, font, max_w)[:max_lines]
+    text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+    return TimedCaptionFit(min_font, lines, min(text_h, max_h), line_h, line_ws)
+
+
+def detect_subtitle_box_in_crop(crop_bgr: np.ndarray, ignore_top: float = 1/3) -> Optional[BBox]:
+    """Detect likely subtitle/text region in a cropped frame (before mirroring).
+
+    Heuristic: morphological blackhat+tophat to emphasize text, then contours.
+    Returns BBox in crop coordinates.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+
+    h, w = crop_bgr.shape[:2]
+    y_min = int(h * ignore_top)
+    roi = crop_bgr[y_min:, :, :]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    kx = max(9, (w // 25) | 1)
+    ky = max(3, (h // 80) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    feat = cv2.addWeighted(blackhat, 1.0, tophat, 1.0, 0)
+
+    feat = cv2.normalize(feat, None, 0, 255, cv2.NORM_MINMAX)
+    _, th = cv2.threshold(feat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    dil = cv2.dilate(th, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)), iterations=2)
+
+    cnts, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    boxes = []
+    for c in cnts:
+        x, y, ww, hh = cv2.boundingRect(c)
+        area = ww * hh
+        if area < (w * h) * 0.0008:
+            continue
+        if hh < 10 or hh > int(h * 0.40):
+            continue
+        if ww < int(w * 0.10):
+            continue
+        boxes.append((x, y, ww, hh))
+
+    if not boxes:
+        return None
+
+    x1 = min(b[0] for b in boxes)
+    y1 = min(b[1] for b in boxes)
+    x2 = max(b[0] + b[2] for b in boxes)
+    y2 = max(b[1] + b[3] for b in boxes)
+
+    # pad a bit
+    pad_x = max(8, w // 40)
+    pad_y = max(10, h // 35)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(w, x2 + pad_x)
+    y2 = min(h - y_min, y2 + pad_y)
+
+    return BBox(x=int(x1), y=int(y1 + y_min), w=int(x2 - x1), h=int(y2 - y1))
+
+
+def union_bbox(a: Optional[BBox], b: Optional[BBox]) -> Optional[BBox]:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    x1 = min(a.x, b.x)
+    y1 = min(a.y, b.y)
+    x2 = max(a.x + a.w, b.x + b.w)
+    y2 = max(a.y + a.h, b.y + b.h)
+    return BBox(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
+
+
+def wrap_text_to_width_keep_newlines(text: str, font: ImageFont.FreeTypeFont, max_w: int):
+    """Wrap text to width preserving explicit newlines."""
+    parts = str(text).split("\n")
+    out: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            out.append("")
+            continue
+        out.extend(wrap_text_to_width(p, font, max_w))
+    # trim trailing empties
+    while out and out[-1] == "":
+        out.pop()
+    return out if out else [""]
+
+
+def fit_text_in_box(text: str, font_path: str, max_w: int, max_h: int,
+                    max_font: int = 72, min_font: int = 22,
+                    line_spacing: float = 1.10, max_lines: int = 4) -> FitResult:
+    """Fit multi-line text (with possible explicit newlines) into a box."""
+    text = unicodedata.normalize("NFC", text)
+    # keep punctuation/accents, but remove controls/emojis to avoid ffmpeg drawtext weirdness
+    text = sanitize_caption(text)
+
+    for size in range(max_font, min_font - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text_to_width_keep_newlines(text, font, max_w)
+        if len(lines) > max_lines:
+            continue
+        text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+        if text_h <= max_h:
+            return FitResult(size, lines, text_h, line_h, line_ws)
+
+    font = ImageFont.truetype(font_path, min_font)
+    lines = wrap_text_to_width_keep_newlines(text, font, max_w)[:max_lines]
+    text_h, line_h, line_ws = measure_lines(lines, font, line_spacing)
+    return FitResult(min_font, lines, min(text_h, max_h), line_h, line_ws)
+
+
+def build_timed_caption_filters(base_label: str,
+                                timed_items,
+                                font_ff: str,
+                                box_x: int, box_y: int, box_w: int, box_h: int,
+                                fontfile: str,
+                                inner_pad_x: int = 24,
+                                inner_pad_y: int = 16,
+                                max_lines: int = 4):
+    """Return (fc_snippet, last_label) that draws timed captions within the box."""
+    if not timed_items:
+        return "", base_label
+
+    # box always present if timed captions enabled
+    v_in = base_label
+    v_out = f"{base_label}_wb"
+    fc = (
+        f"[{v_in}]drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color=white@1:t=fill"
+        f"[{v_out}];"
+    )
+    v_in = v_out
+
+    max_w = max(10, box_w - (inner_pad_x * 2))
+    max_h = max(10, box_h - (inner_pad_y * 2))
+
+    for i, (ts, te, txt) in enumerate(timed_items):
+        fit = fit_text_in_box(
+            txt,
+            fontfile,
+            max_w=max_w,
+            max_h=max_h,
+            max_font=64,
+            min_font=22,
+            line_spacing=1.08,
+            max_lines=max_lines,
+        )
+
+        # vertical center
+        y_block = box_y + inner_pad_y + max(0, (max_h - fit.text_h) // 2)
+
+        for j, ln in enumerate(fit.lines):
+            ln_esc = ff_escape_text(ln)
+            x_line = box_x + inner_pad_x + max(0, (max_w - int(fit.line_ws[j])) // 2)
+            y_line = y_block + (j * fit.line_h)
+            v_next = f"tc{i}_{j}"
+            fc += (
+                f"[{v_in}]drawtext=fontfile='{font_ff}':text='{ln_esc}':"
+                f"fontsize={fit.font_size}:x={x_line}:y={y_line}:"
+                f"fontcolor=yellow:borderw=6:bordercolor=black:"
+                f"enable='between(t,{ts:.3f},{te:.3f})'"
+                f"[{v_next}];"
+            )
+            v_in = v_next
+
+    return fc, v_in
+
+
+
+# ======================================================
 # /render_binary  (MAIN RENDER ENDPOINT)
 # ======================================================
 @app.post("/render_binary")
@@ -412,9 +691,11 @@ def render_binary():
         }), 400
 
     caption = request.form.get("caption", "")
+    timed_raw = request.form.get("timed_captions", "")
     vid_id = str(request.form.get("id", "video"))
 
     app.logger.info(f"[render_binary] id={vid_id} caption_len={len(caption)}")
+    app.logger.info(f"[render_binary] timed_captions_len={len(str(timed_raw or ''))}")
     app.logger.info(f"[render_binary] files_keys={list(request.files.keys())}")
 
     # Font: try user-provided FONTFILE first, then common repo paths, then system fonts.
@@ -433,6 +714,19 @@ def render_binary():
     if not os.path.exists(fontfile):
         app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
         return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
+
+    # Timed captions (optional). If missing or equals "0", ignore completely.
+    timed_enabled = False
+    timed_items = []
+    try:
+        tr = ("" if timed_raw is None else str(timed_raw)).strip()
+        if tr and tr != "0":
+            timed_items = parse_timed_captions(tr)
+            timed_items = extend_caption_ends_midpoint(timed_items)
+            timed_enabled = len(timed_items) > 0
+    except Exception:
+        timed_enabled = False
+        timed_items = []
 
     tmp_dir = tempfile.mkdtemp(prefix="render_")
     in_path = os.path.join(tmp_dir, f"{vid_id}.mp4")
@@ -475,6 +769,53 @@ def render_binary():
         bbox.y = max(0, min(bbox.y, src_h - 1))
         bbox.w = max(1, min(bbox.w, src_w - bbox.x))
         bbox.h = max(1, min(bbox.h, src_h - bbox.y))
+
+        # --- timed subtitles box (detected on the cropped foreground BEFORE mirror) ---
+        sub_box_crop = None
+        if timed_enabled:
+            # Prefer sampling around first caption entries (better than random timestamps)
+            times = [0.6]
+            for it in timed_items[:5]:
+                try:
+                    times.append(max(0.0, float(it[0]) + 0.05))
+                except Exception:
+                    pass
+            # plus a couple of generic times
+            times.extend([1.2, 2.2])
+            times = list(dict.fromkeys(times))[:8]
+
+            for i, t in enumerate(times):
+                fp = os.path.join(tmp_dir, f"___tc{i}.png")
+                if not extract_frame(in_path, fp, t):
+                    continue
+                img = cv2.imread(fp, cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                # crop to the same bbox that will become the foreground (pre hflip)
+                crop = img[bbox.y:bbox.y + bbox.h, bbox.x:bbox.x + bbox.w]
+                try:
+                    sb = detect_subtitle_box_in_crop(crop, ignore_top=1/3)
+                except Exception:
+                    sb = None
+                sub_box_crop = union_bbox(sub_box_crop, sb)
+
+            # Fallback: bottom region of crop
+            if sub_box_crop is None:
+                sub_box_crop = BBox(
+                    x=int(bbox.w * 0.10),
+                    y=int(bbox.h * 0.70),
+                    w=int(bbox.w * 0.80),
+                    h=int(bbox.h * 0.22),
+                )
+
+            # shrink height slightly (as requested)
+            sub_box_crop.h = max(8, int(round(sub_box_crop.h * 0.93)))
+
+            # clamp
+            sub_box_crop.x = max(0, min(sub_box_crop.x, bbox.w - 1))
+            sub_box_crop.y = max(0, min(sub_box_crop.y, bbox.h - 1))
+            sub_box_crop.w = max(1, min(sub_box_crop.w, bbox.w - sub_box_crop.x))
+            sub_box_crop.h = max(1, min(sub_box_crop.h, bbox.h - sub_box_crop.y))
 
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 720, 1280
@@ -561,6 +902,34 @@ def render_binary():
         x0j = max(0, min(CANVAS_W - out_cw_fg, (x0 + jx) + FG_TRIM_X))
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
+        # Timed captions target box in final canvas coordinates
+        tc_box = None
+        if timed_enabled and sub_box_crop is not None:
+            # scale from crop coords -> foreground scaled coords
+            sx = out_cw / float(bbox.w)
+            sy = out_ch / float(bbox.h)
+
+            x1 = int(round(sub_box_crop.x * sx))
+            y1 = int(round(sub_box_crop.y * sy))
+            x2 = int(round((sub_box_crop.x + sub_box_crop.w) * sx))
+            y2 = int(round((sub_box_crop.y + sub_box_crop.h) * sy))
+
+            # mirror horizontally because the foreground is hflip'ed in ffmpeg
+            x1m = out_cw - x2
+            x2m = out_cw - x1
+
+            bx1 = x0j + x1m
+            by1 = y0j + y1
+            bw = max(2, x2m - x1m)
+            bh = max(2, y2 - y1)
+
+            # clamp to canvas
+            bx1 = max(0, min(bx1, CANVAS_W - 2))
+            by1 = max(0, min(by1, CANVAS_H - 2))
+            bw = max(2, min(bw, CANVAS_W - bx1))
+            bh = max(2, min(bh, CANVAS_H - by1))
+            tc_box = (bx1, by1, bw, bh)
+
         # 2) Tiny noise
         noise_strength = random.choice([1, 2, 3])
 
@@ -601,9 +970,27 @@ def render_binary():
         
         # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
-        
-        # 6) Drawtext top (stroke 4px)
+
+        # 6) Optional: white box + timed captions (only if timed_captions provided)
         v_in = "v0"
+        if timed_enabled and tc_box is not None:
+            tfx, tfy, tfw, tfh = tc_box
+            tc_fc, v_in = build_timed_caption_filters(
+                base_label=v_in,
+                timed_items=timed_items,
+                font_ff=font_ff,
+                box_x=int(tfx),
+                box_y=int(tfy),
+                box_w=int(tfw),
+                box_h=int(tfh),
+                fontfile=fontfile,
+                inner_pad_x=24,
+                inner_pad_y=16,
+                max_lines=4,
+            )
+            fc += tc_fc
+        
+        # 7) Drawtext top (stroke 4px)
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
             v_out = f"vt{i}"
@@ -614,8 +1001,8 @@ def render_binary():
                 f"[{v_out}];"
             )
             v_in = v_out
-        
-        # 7) CTA + noise + fps -> vout
+
+        # 8) CTA + noise + fps -> vout
         cta_esc = ff_escape_text(cta_text)
         fc += (
             f"[{v_in}]"
