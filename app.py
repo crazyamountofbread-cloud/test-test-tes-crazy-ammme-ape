@@ -487,12 +487,9 @@ def render_binary():
         
         sub_y1 = sub_y2 = None
         if len(sub_bands) >= 2:
-            ys1 = int(np.median([b[0] for b in sub_bands]))
-            ys2 = int(np.median([b[1] for b in sub_bands]))
-        
-            # converte CROPPED -> ORIGINAL
-            sub_y1 = bbox.y + ys1
-            sub_y2 = bbox.y + ys2
+            sub_y1 = int(np.median([b[0] for b in sub_bands]))  # coords NO CROPPED
+            sub_y2 = int(np.median([b[1] for b in sub_bands]))  # coords NO CROPPED
+
         
         has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)
          
@@ -506,23 +503,6 @@ def render_binary():
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2
-
-        # --- subtitle overlay placement (canvas coords) ---
-        sub_h_src = None
-        y_sub = None
-        
-        if has_sub:
-            src_w, src_h = ffprobe_dims(in_path)
-            sub_h_src = max(2, sub_y2 - sub_y1)
-        
-            sub_scale = CANVAS_W / bbox.w
-            sub_h_out = int(round(sub_h_src * sub_scale))
-
-        
-            SUB_PAD_FROM_FG_BOTTOM = 8
-            y_sub = int(y0 + out_ch - sub_h_out - SUB_PAD_FROM_FG_BOTTOM)
-            if y_sub < 0:
-                y_sub = 0
 
         
         # >>> ADD: trim 10px each side on the FINAL foreground (in pixels)
@@ -617,8 +597,8 @@ def render_binary():
             f"[vcrop];"
         )
         
-        # 2) Duplica o crop pra virar BG e FG
-        fc += f"[vcrop]split=2[vbgsrc][vfgsrc];"
+        # 2) Duplica o crop pra virar BG e FG e o bagui da legenda burned tbm.
+        fc += f"[vcrop]split=3[vbgsrc][vfgsrc][vsubsrc];"
         
         # 3) BG: pega o crop, aumenta pra preencher o canvas (fill) e recorta pro 9:16 + blur
         fc += (
@@ -641,18 +621,25 @@ def render_binary():
         # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
         
-        # 5.5) Subtitle band overlay (ONLY if detected)
+        # 5.5) Subtitle band overlay (ONLY if detected) - from vcrop, same scale as FG, NOT mirrored, same position
         v_start = "v0"
         if has_sub:
+            sub_h_src = max(2, sub_y2 - sub_y1)
+            sub_h_out = int(round(sub_h_src * scale))                 # mesma escala do FG
+            y_sub_canvas = int(round(y0j + (sub_y1 * scale)))         # posição REAL no canvas (onde ela estava)
+            x_sub_canvas = x0j                                        # mesmo x do FG
+        
             fc += (
-                f"[0:v]"
-                f"crop={src_w}:{sub_h_src}:0:{sub_y1},"
-                f"scale={CANVAS_W}:-1:flags=lanczos,"
+                f"[vsubsrc]"
+                f"crop={bbox.w}:{sub_h_src}:0:{sub_y1},"
+                f"scale={out_cw}:{sub_h_out}:flags=lanczos,"
+                f"crop={out_cw_fg}:{sub_h_out}:{FG_TRIM_X}:0,"
                 f"setsar=1"
                 f"[sub];"
             )
-            fc += f"[v0][sub]overlay=0:{y_sub}[v0s];"
+            fc += f"[v0][sub]overlay={x_sub_canvas}:{y_sub_canvas}[v0s];"
             v_start = "v0s"
+
         
         # 6) Drawtext starts from v_start
         v_in = v_start
