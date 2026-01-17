@@ -497,7 +497,7 @@ def render_binary():
             sub_h_out = int(round(sub_h_src * sub_scale))
         
             SUB_PAD_FROM_FG_BOTTOM = 8
-            y_sub = int(y0j + out_ch - sub_h_out - SUB_PAD_FROM_FG_BOTTOM)
+            y_sub = int(y0 + out_ch - sub_h_out - SUB_PAD_FROM_FG_BOTTOM)
             if y_sub < 0:
                 y_sub = 0
 
