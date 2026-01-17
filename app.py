@@ -86,64 +86,85 @@ def still():
 #NEW:
 def detect_burned_sub_band(img_bgr):
     """
-    Retorna (y1, y2) EXATO da legenda burned-in (com padding leve), ou None.
-    Base: máscara HSV (amarelo/branco) + bounding box dos pixels detectados.
+    Retorna (y1, y2) da legenda burned-in (faixa bem justa), ou None.
+    Agora: procura APENAS no fundo do frame e ignora bordas laterais (moldura).
     """
     h, w = img_bgr.shape[:2]
 
-    # procura numa área maior (pra não perder legendas mais altas)
-    y_start = int(h * 0.35)
-    roi = img_bgr[y_start:, :]
+    # --- procurar só onde legenda de fala normalmente fica (parte de baixo) ---
+    y_start = int(h * 0.60)
+    y_end   = int(h * 0.96)
+    if y_end <= y_start + 10:
+        return None
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    roi = img_bgr[y_start:y_end, :]
+
+    # ignora as bordas laterais (moldura branca costuma “enganar”)
+    x_margin = int(w * 0.07)  # 7% de cada lado
+    roi_use = roi[:, x_margin:w - x_margin]
+
+    hsv = cv2.cvtColor(roi_use, cv2.COLOR_BGR2HSV)
     H = hsv[..., 0].astype(np.int16)
     S = hsv[..., 1].astype(np.int16)
     V = hsv[..., 2].astype(np.int16)
 
-    # amarelo + branco (bem típico de caption)
+    # amarelo + branco (legendas típicas)
     mask_white  = (V > 215) & (S < 90)
-    mask_yellow = (H >= 15) & (H <= 50) & (S > 70) & (V > 110)
-
+    mask_yellow = (H >= 15) & (H <= 55) & (S > 70) & (V > 110)
     mask = (mask_white | mask_yellow).astype(np.uint8) * 255
 
-    # junta letras e remove ruído
     k = max(3, (min(h, w) // 260) | 1)
     kernel = np.ones((k, k), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # densidade de "texto" por linha
+    # densidade por linha
     row = (mask.mean(axis=1) / 255.0)
-    row_s = smooth1d(row, k=max(9, (roi.shape[0] // 50) | 1))
-    
+    row_s = smooth1d(row, k=max(9, (mask.shape[0] // 50) | 1))
+
     peak = float(row_s.max())
-    if peak < 0.008:  # sem texto suficiente
+    if peak < 0.010:
         return None
-    
-    # pega só as linhas perto do pico (isso corta o excesso em altura)
-    thr = max(0.010, peak * 0.55)
+
+    # threshold relativo ao pico
+    thr = max(0.012, peak * 0.62)
     idx = np.where(row_s >= thr)[0]
-    seg = largest_contiguous_segment(idx)
-    if seg is None:
+    if idx.size == 0:
         return None
-    
-    y1, y2 = seg
-    
-    # rejeita faixa absurda (segurança)
-    if (y2 - y1) > int(roi.shape[0] * 0.55):
+
+    # ---- pega o SEGMENTO mais perto do fundo (não o maior) ----
+    d = np.diff(idx)
+    breaks = np.where(d > 1)[0]
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends   = np.r_[idx[breaks], idx[-1]]
+
+    # escolhe o segmento com maior "end" (mais embaixo), com tamanho mínimo
+    best = None
+    for s, e in zip(starts, ends):
+        length = int(e - s + 1)
+        if length < max(18, mask.shape[0] // 40):
+            continue
+        if best is None or e > best[1]:
+            best = (int(s), int(e))
+
+    if best is None:
         return None
-    
-    # padding BEM pequeno (só pra outline)
-    pad_up = 6
-    pad_dn = 8
+
+    y1, y2 = best
+
+    # padding pequeno (bem justo)
+    pad_up = 4
+    pad_dn = 6
+
     y1g = max(0, y_start + y1 - pad_up)
     y2g = min(h - 1, y_start + y2 + pad_dn)
-    
-    # mínimo de altura ainda “legenda”
-    if (y2g - y1g) < max(28, h // 45):
+
+    # altura mínima plausível de legenda
+    if (y2g - y1g) < max(22, h // 55):
         return None
-    
+
     return int(y1g), int(y2g)
+
 
 
 
