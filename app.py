@@ -86,13 +86,13 @@ def still():
 #NEW:
 def detect_burned_sub_band(img_bgr):
     """
-    Retorna (y1, y2) da faixa de legenda burned-in, ou None.
-    Heurística: detecta pixels de texto (amarelo/branco) no terço inferior.
+    Retorna (y1, y2) EXATO da legenda burned-in (com padding leve), ou None.
+    Base: máscara HSV (amarelo/branco) + bounding box dos pixels detectados.
     """
     h, w = img_bgr.shape[:2]
 
-    # procura mais embaixo (essas legendas ficam bem no bottom)
-    y_start = int(h * 0.55)
+    # procura numa área maior (pra não perder legendas mais altas)
+    y_start = int(h * 0.35)
     roi = img_bgr[y_start:, :]
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -100,41 +100,36 @@ def detect_burned_sub_band(img_bgr):
     S = hsv[..., 1].astype(np.int16)
     V = hsv[..., 2].astype(np.int16)
 
-    # branco (muito brilho, pouca saturação) + amarelo (H ~ 20-45)
+    # amarelo + branco (bem típico de caption)
     mask_white  = (V > 215) & (S < 90)
-    mask_yellow = (H >= 15) & (H <= 45) & (S > 80) & (V > 120)
+    mask_yellow = (H >= 15) & (H <= 50) & (S > 70) & (V > 110)
 
     mask = (mask_white | mask_yellow).astype(np.uint8) * 255
 
-    # limpa ruído / junta letras
+    # junta letras e remove ruído
     k = max(3, (min(h, w) // 260) | 1)
     kernel = np.ones((k, k), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # densidade por linha (fração de pixels de "texto")
-    row = (mask.mean(axis=1) / 255.0)
-    row_s = smooth1d(row, k=max(11, (roi.shape[0] // 35) | 1))
-
-    # threshold mais permissivo
-    thr = max(0.010, float(row_s.max()) * 0.35)
-    idx = np.where(row_s > thr)[0]
-    seg = largest_contiguous_segment(idx)
-    if seg is None:
+    ys, xs = np.where(mask > 0)
+    if ys.size < (w * 0.002):  # muito pouco "texto" -> sem legenda
         return None
 
-    y1, y2 = seg
+    y1 = int(np.percentile(ys, 2))
+    y2 = int(np.percentile(ys, 98))
 
-    # padding pra pegar borda/outline e fundo
-    pad = max(10, h // 80)
-    y1 = max(0, y_start + y1 - pad)
-    y2 = min(h - 1, y_start + y2 + pad)
-
-    # rejeita faixas pequenas (evita falso positivo)
-    if (y2 - y1) < max(55, h // 28):
+    # rejeita faixa muito fina
+    if (y2 - y1) < max(45, h // 30):
         return None
 
-    return int(y1), int(y2)
+    # padding leve pra pegar outline/fundo (sem “descer” demais)
+    pad_up = max(8, h // 120)
+    pad_dn = max(10, h // 110)
+    y1g = max(0, y_start + y1 - pad_up)
+    y2g = min(h - 1, y_start + y2 + pad_dn)
+
+    return y1g, y2g
 
 
 
