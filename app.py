@@ -452,23 +452,35 @@ def render_binary():
 
 
         #NEW:
-        # --- detect subtitle band on ORIGINAL (burned-in) ---
+        # --- detect subtitle band on CROPPED (bbox) ---
         sub_bands = []
         for fp in frames:
             img = cv2.imread(fp, cv2.IMREAD_COLOR)
             if img is None:
                 continue
-            band = detect_burned_sub_band(img)
+        
+            h0, w0 = img.shape[:2]
+            x1 = max(0, min(bbox.x, w0 - 1))
+            y1 = max(0, min(bbox.y, h0 - 1))
+            x2 = max(x1 + 1, min(bbox.x + bbox.w, w0))
+            y2 = max(y1 + 1, min(bbox.y + bbox.h, h0))
+            img_crop = img[y1:y2, x1:x2]
+        
+            band = detect_burned_sub_band(img_crop)  # band em coords do CROPPED
             if band:
                 sub_bands.append(band)
         
         sub_y1 = sub_y2 = None
-        if len(sub_bands) >= 2:  # <<< só considera se detectar em 2+ frames
-            ys1 = np.median([b[0] for b in sub_bands])
-            ys2 = np.median([b[1] for b in sub_bands])
-            sub_y1, sub_y2 = int(ys1), int(ys2)
+        if len(sub_bands) >= 2:
+            ys1 = int(np.median([b[0] for b in sub_bands]))
+            ys2 = int(np.median([b[1] for b in sub_bands]))
         
-        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)  
+            # converte CROPPED -> ORIGINAL
+            sub_y1 = bbox.y + ys1
+            sub_y2 = bbox.y + ys2
+        
+        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)
+         
 
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 720, 1280
@@ -488,8 +500,9 @@ def render_binary():
             src_w, src_h = ffprobe_dims(in_path)
             sub_h_src = max(2, sub_y2 - sub_y1)
         
-            sub_scale = CANVAS_W / src_w
+            sub_scale = CANVAS_W / bbox.w
             sub_h_out = int(round(sub_h_src * sub_scale))
+
         
             SUB_PAD_FROM_FG_BOTTOM = 8
             y_sub = int(y0 + out_ch - sub_h_out - SUB_PAD_FROM_FG_BOTTOM)
