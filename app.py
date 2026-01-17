@@ -112,24 +112,39 @@ def detect_burned_sub_band(img_bgr):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    ys, xs = np.where(mask > 0)
-    if ys.size < (w * 0.002):  # muito pouco "texto" -> sem legenda
+    # densidade de "texto" por linha
+    row = (mask.mean(axis=1) / 255.0)
+    row_s = smooth1d(row, k=max(9, (roi.shape[0] // 50) | 1))
+    
+    peak = float(row_s.max())
+    if peak < 0.008:  # sem texto suficiente
         return None
-
-    y1 = int(np.percentile(ys, 2))
-    y2 = int(np.percentile(ys, 98))
-
-    # rejeita faixa muito fina
-    if (y2 - y1) < max(45, h // 30):
+    
+    # pega só as linhas perto do pico (isso corta o excesso em altura)
+    thr = max(0.010, peak * 0.55)
+    idx = np.where(row_s >= thr)[0]
+    seg = largest_contiguous_segment(idx)
+    if seg is None:
         return None
-
-    # padding leve pra pegar outline/fundo (sem “descer” demais)
-    pad_up = max(8, h // 120)
-    pad_dn = max(10, h // 110)
+    
+    y1, y2 = seg
+    
+    # rejeita faixa absurda (segurança)
+    if (y2 - y1) > int(roi.shape[0] * 0.55):
+        return None
+    
+    # padding BEM pequeno (só pra outline)
+    pad_up = 6
+    pad_dn = 8
     y1g = max(0, y_start + y1 - pad_up)
     y2g = min(h - 1, y_start + y2 + pad_dn)
+    
+    # mínimo de altura ainda “legenda”
+    if (y2g - y1g) < max(28, h // 45):
+        return None
+    
+    return int(y1g), int(y2g)
 
-    return y1g, y2g
 
 
 
