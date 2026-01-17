@@ -511,20 +511,39 @@ def ensure_east_model(tmp_dir: str) -> str:
     ]
     for p in candidates:
         if p and os.path.exists(p):
+            print(f"[render_binary] EAST model found at: {p}", flush=True)
             return p
+
     url = os.environ.get(
         "EAST_MODEL_URL",
         "https://raw.githubusercontent.com/opencv/opencv_extra/master/testdata/dnn/frozen_east_text_detection.pb",
     )
     outp = os.path.join(tmp_dir, "frozen_east_text_detection.pb")
-    urllib.request.urlretrieve(url, outp)
+    print(f"[render_binary] EAST model not found. Downloading from: {url}", flush=True)
+
+    try:
+        urllib.request.urlretrieve(url, outp)
+    except Exception as e:
+        print(f"[render_binary] EAST download FAILED: {e}", flush=True)
+        raise
+
+    if not os.path.exists(outp):
+        raise RuntimeError("EAST model download finished but file missing")
+
+    print(f"[render_binary] EAST model downloaded to: {outp}", flush=True)
     return outp
 
 
 def apply_timed_captions_overlay(base_video: str, out_video: str, box_xyxy, items, font_path: str):
+    print(f"[render_binary] [tc] overlay start | base={base_video}", flush=True)
+    print(f"[render_binary] [tc] overlay box={box_xyxy}", flush=True)
+    print(f"[render_binary] [tc] overlay items={len(items)}", flush=True)
+    print(f"[render_binary] [tc] overlay font={font_path}", flush=True)
+
     cap = cv2.VideoCapture(base_video)
     if not cap.isOpened():
         raise RuntimeError("failed to open base video")
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -545,12 +564,14 @@ def apply_timed_captions_overlay(base_video: str, out_video: str, box_xyxy, item
     y2 = max(y1 + 1, min(H - 1, int(y2)))
 
     frame_idx = 0
+    last_print = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        # white box ALWAYS
+        # white box ALWAYS (enquanto timed_captions estiver habilitado)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), -1)
 
         t = frame_idx / fps
@@ -559,10 +580,15 @@ def apply_timed_captions_overlay(base_video: str, out_video: str, box_xyxy, item
             frame = draw_caption_pil(frame, (x1, y1, x2, y2), txt, font_path)
 
         out.write(frame)
+
         frame_idx += 1
+        if frame_idx - last_print >= 60:
+            last_print = frame_idx
+            print(f"[render_binary] [tc] overlay progress frame={frame_idx} t={t:.2f}s", flush=True)
 
     cap.release()
     out.release()
+    print(f"[render_binary] [tc] overlay done frames={frame_idx}", flush=True)
 
 
 @dataclass
@@ -730,30 +756,43 @@ def fit_text_top(text: str, font_path: str, max_w: int, max_h: int,
 # ======================================================
 @app.post("/render_binary")
 def render_binary():
-    app.logger.info("[render_binary] START")
+    # logs garantidos no Render
+    def rb(msg: str):
+        print(msg, flush=True)
+        try:
+            app.logger.info(msg)
+        except Exception:
+            pass
+
+    rb("[render_binary] START")
 
     if "file" in request.files:
         f = request.files["file"]
     elif len(request.files) > 0:
         f = next(iter(request.files.values()))
     else:
-        app.logger.error("[render_binary] missing file")
-        return jsonify({
-            "error": "missing file",
-            "files_keys": list(request.files.keys())
-        }), 400
+        rb("[render_binary] ERROR missing file")
+        return jsonify({"error": "missing file", "files_keys": list(request.files.keys())}), 400
 
     caption = request.form.get("caption", "")
     vid_id = str(request.form.get("id", "video"))
 
-    # Optional: timed captions with timestamps (validated pipeline)
+    # timed captions: aceita nomes alternativos também (pra não depender 100% do node)
     timed_captions_raw = (request.form.get("timed_captions", "") or "").strip()
+    if not timed_captions_raw:
+        timed_captions_raw = (request.form.get("timedCaptions", "") or "").strip()
+    if not timed_captions_raw:
+        timed_captions_raw = (request.form.get("timestamps", "") or "").strip()
+
     timed_captions_enabled = bool(timed_captions_raw) and timed_captions_raw != "0"
 
-    app.logger.info(f"[render_binary] id={vid_id} caption_len={len(caption)}")
-    app.logger.info(f"[render_binary] files_keys={list(request.files.keys())}")
+    rb(f"[render_binary] id={vid_id} caption_len={len(caption)}")
+    rb(f"[render_binary] files_keys={list(request.files.keys())}")
+    rb(f"[render_binary] timed_enabled={timed_captions_enabled} timed_len={len(timed_captions_raw)}")
+    if timed_captions_enabled:
+        rb(f"[render_binary] timed_head={timed_captions_raw[:80]!r}")
 
-    # Font: try user-provided FONTFILE first, then common repo paths, then system fonts.
+    # Font
     font_candidates = [
         os.environ.get("FONTFILE", "").strip(),
         "./fonts/GoogleSans-VariableFont_GRAD,opsz,wght.ttf",
@@ -763,11 +802,8 @@ def render_binary():
     ]
     fontfile = resolve_font_path(font_candidates)
 
-    # (logo removida do render; mantemos LOGO_PATH só por compat, mas não exigimos arquivo)
-    logo_path = os.environ.get("LOGO_PATH", "./Logo.png")
-
     if not os.path.exists(fontfile):
-        app.logger.error(f"[render_binary] fontfile missing: {fontfile}")
+        rb(f"[render_binary] ERROR fontfile missing: {fontfile}")
         return jsonify({"error": "missing fontfile on server", "path": fontfile}), 500
 
     tmp_dir = tempfile.mkdtemp(prefix="render_")
@@ -775,11 +811,10 @@ def render_binary():
     out_path = os.path.join(tmp_dir, f"{vid_id}F.mp4")
 
     try:
-        # save upload
         f.save(in_path)
-        app.logger.info("[render_binary] file saved, detecting bbox")
+        rb("[render_binary] upload saved")
 
-        # --- detect bbox (ignore overlay text) using a few frames ---
+        # --- bbox detect (seu código original) ---
         sample_times = [0.5, 1.2, 2.0, 3.0]
         frames = []
         for i, t in enumerate(sample_times):
@@ -798,211 +833,231 @@ def render_binary():
                 continue
 
         if not bboxes:
-            # fallback: assume full frame
             w, h = ffprobe_dims(in_path)
             bbox = BBox(0, 0, w, h)
-            app.logger.warning("[render_binary] bbox detection failed, using full frame")
+            rb("[render_binary] WARN bbox detection failed, using full frame")
         else:
             bbox = median_bbox(bboxes)
 
         src_w, src_h = ffprobe_dims(in_path)
-        # clamp bbox
         bbox.x = max(0, min(bbox.x, src_w - 1))
         bbox.y = max(0, min(bbox.y, src_h - 1))
         bbox.w = max(1, min(bbox.w, src_w - bbox.x))
         bbox.h = max(1, min(bbox.h, src_h - bbox.y))
 
-        # --- fixed 9:16 canvas ---
-        CANVAS_W, CANVAS_H = 720, 1280
+        rb(f"[render_binary] bbox={bbox}")
 
-        # Foreground: scale cropped to fit canvas
+        # --- canvas (original) ---
+        CANVAS_W, CANVAS_H = 720, 1280
         scale = min(CANVAS_W / bbox.w, CANVAS_H / bbox.h)
         out_cw = int(round(bbox.w * scale))
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2
-        
-        # >>> ADD: trim 10px each side on the FINAL foreground (in pixels)
+
         FG_TRIM_X = 10
         out_cw_fg = max(2, out_cw - (FG_TRIM_X * 2))
 
-
-        # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
+        # --- TOP TEXT (original) ---
         top_gap = 15
         space_above = max(10, y0 - top_gap)
         top_box_w = int(round(CANVAS_W * 0.82))
         fit = fit_text_top(
-            caption,
-            fontfile,
+            caption, fontfile,
             max_w=top_box_w,
             max_h=space_above,
-            max_font=58,      # menor
-            min_font=28,      # menor
-            line_spacing=1.06,# menos distancia entre linhas
+            max_font=58,
+            min_font=28,
+            line_spacing=1.06,
             max_lines=3,
         )
 
-        
-        TOP_MARGIN = 28  # espaço obrigatório no topo
+        TOP_MARGIN = 28
         y_block = (y0 - top_gap) - fit.text_h
         if y_block < TOP_MARGIN:
             y_block = TOP_MARGIN
 
-
-        line_xs = []
-        for lw in fit.line_ws:
-            line_xs.append(max(0, (CANVAS_W - lw) // 2))
+        line_xs = [max(0, (CANVAS_W - lw) // 2) for lw in fit.line_ws]
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
 
-        # --- CTA (NOW: over the video, near the bottom of the foreground) ---
+        # --- CTA (original) ---
         cta_text = "Siga @SuperEmAlta"
         cta_font_size = 48
         font_obj = ImageFont.truetype(fontfile, cta_font_size)
         bb = font_obj.getbbox(cta_text)
         cta_w = bb[2] - bb[0]
         cta_h = bb[3] - bb[1]
-        
+
         CTA_PAD_X = 28
         CTA_PAD_Y = 14
-        CTA_BOTTOM_PAD = 18  # distance from the bottom edge of the FG video
-        
-        # position relative to the foreground (use non-jittered y0 here; jitter is applied in overlay anyway)
+        CTA_BOTTOM_PAD = 18
+
         y_cta = y0 + out_ch - cta_h - CTA_BOTTOM_PAD
         if y_cta < 0:
             y_cta = 0
-        
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
-        
-        # CTA background box (black 50%)
+
         box_w = cta_w + (CTA_PAD_X * 2)
         box_h = cta_h + (CTA_PAD_Y * 2)
         x_box = max(0, (CANVAS_W - box_w) // 2)
         y_box = max(0, y_cta - CTA_PAD_Y)
 
-
-        # --- ffmpeg filter_complex ---
         font_ff = escape_filter_path(fontfile)
 
-        # ======================================================
-        # Anti-fingerprint micro-variations (imperceptible)
-        # ======================================================
+        # jitter/noise/audio (original)
         try:
             random.seed(f"{vid_id}-{os.environ.get('SEED_SALT','0')}")
         except Exception:
             pass
 
-        # 1) Jitter in positions
         jx = random.randint(-2, 2)
         jy = random.randint(-2, 2)
         x0j = max(0, min(CANVAS_W - out_cw_fg, (x0 + jx) + FG_TRIM_X))
         y0j = max(0, min(CANVAS_H - out_ch, y0 + jy))
 
-        # ------------------------------------------------------
-        # Timed captions: compute the global subtitle box on the
-        # CROPPED foreground BEFORE any hflip, then map to canvas.
-        # If no valid timed captions are provided, we do nothing.
-        # ------------------------------------------------------
+        noise_strength = random.choice([1, 2, 3])
+        atempo = random.choice([0.99, 1.0, 1.01])
+
+        # ======================================================
+        # Timed captions (EAST) — FULL fg scan, BEFORE hflip
+        # ======================================================
         tc_box_canvas = None
         tc_items = []
+
         if timed_captions_enabled:
+            rb("[render_binary] [tc] START parsing timed captions")
             try:
-                # Accept both formats: real newlines OR literal "\\n".
                 tc_text = timed_captions_raw.replace("\\n", "\n") if "\\n" in timed_captions_raw else timed_captions_raw
                 tc_text = unicodedata.normalize("NFC", tc_text)
                 tc_items = parse_timed_captions(tc_text)
                 tc_items = extend_caption_ends_midpoint(tc_items)
-
+                rb(f"[render_binary] [tc] parsed items={len(tc_items)}")
                 if tc_items:
-                    model_path = ensure_east_model(tmp_dir)
-                    net = cv2.dnn.readNet(model_path)
+                    rb(f"[render_binary] [tc] first={tc_items[0][0]:.3f}->{tc_items[0][1]:.3f} '{tc_items[0][2][:40]}'")
 
-                    # sample several times across the clip
-                    sample_times_tc = [0.5, 1.2, 2.0, 3.0, 4.0, 5.0]
-                    global_rect = None
-
-                    for i, tsec in enumerate(sample_times_tc):
-                        fp = os.path.join(tmp_dir, f"___tc_fg_{i}.png")
-                        vf = f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},scale={out_cw}:{out_ch}:flags=lanczos"
-                        cmdfg = [
-                            "ffmpeg", "-y",
-                            "-ss", str(tsec),
-                            "-i", in_path,
-                            "-vf", vf,
-                            "-vframes", "1",
-                            "-q:v", "2",
-                            fp,
-                        ]
-                        rfg = subprocess.run(cmdfg, capture_output=True, text=True)
-                        if rfg.returncode != 0 or not os.path.exists(fp):
-                            continue
-
-                        frame = cv2.imread(fp, cv2.IMREAD_COLOR)
-                        if frame is None:
-                            continue
-                        Hf, Wf = frame.shape[:2]
-                        boxes = _east_filter_ignore_top(_east_detect_text_boxes(frame, net), Hf, EAST_IGNORE_TOP)
-                        if not boxes:
-                            continue
-
-                        # union with 50% rule (exactly like validated script)
-                        if global_rect is None:
-                            global_rect = (
-                                min(b[0] for b in boxes), min(b[1] for b in boxes),
-                                max(b[2] for b in boxes), max(b[3] for b in boxes),
-                            )
-                        else:
-                            for b in boxes:
-                                inter = _intersection_area(global_rect, b)
-                                if _rect_area(b) > 0 and (inter / _rect_area(b)) < 0.5:
-                                    global_rect = _expand_rect(global_rect, b)
-
-                    if global_rect is not None:
-                        # padding + slight height shrink (validated)
-                        global_rect = _apply_padding(global_rect, out_cw, out_ch)
-                        global_rect = _shrink_height(global_rect, TC_HEIGHT_SHRINK_RATIO, out_ch)
-                        gx1, gy1, gx2, gy2 = global_rect
-
-                        # map from pre-hflip FG coords -> post-hflip coords
-                        hx1 = out_cw - gx2
-                        hx2 = out_cw - gx1
-
-                        # map into canvas (FG is hflipped in ffmpeg and placed at x0j,y0j)
-                        tc_box_canvas = (
-                            x0j + hx1,
-                            y0j + gy1,
-                            x0j + hx2,
-                            y0j + gy2,
-                        )
-                    else:
-                        # no detected text boxes => disable overlay
-                        tc_items = []
-                        tc_box_canvas = None
+                if not tc_items:
+                    rb("[render_binary] [tc] parsed=0 -> disable timed overlay")
+                    timed_captions_enabled = False
             except Exception as e:
-                app.logger.error(f"[render_binary] timed_captions disabled (error): {e}")
+                rb(f"[render_binary] [tc] parse FAILED: {e}")
+                timed_captions_enabled = False
                 tc_items = []
-                tc_box_canvas = None
 
-        # 2) Tiny noise
-        noise_strength = random.choice([1, 2, 3])
+        if timed_captions_enabled:
+            rb("[render_binary] [tc] Resolving EAST model...")
+            model_path = ensure_east_model(tmp_dir)
+            rb(f"[render_binary] [tc] EAST model path={model_path}")
 
-        # 3) Tiny audio tempo shift
-        atempo = random.choice([0.99, 1.0, 1.01])
+            rb("[render_binary] [tc] Building fg_noflip temp video...")
+            fg_path = os.path.join(tmp_dir, "__fg_noflip.mp4")
 
-        # Background + Foreground: ambos derivados do MESMO crop (bbox)
+            # mesmo recorte que alimenta FG, mas SEM hflip
+            # (30 fps, sem áudio)
+            vf_fg = (
+                f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
+                f"scale={out_cw}:{out_ch}:flags=lanczos,"
+                f"fps=30,setsar=1"
+            )
+            cmd_fg = [
+                "ffmpeg", "-y",
+                "-ss", "0.35",
+                "-i", in_path,
+                "-vf", vf_fg,
+                "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-movflags", "+faststart",
+                fg_path
+            ]
+            rb("[render_binary] [tc] CMD fg_noflip=" + " ".join(cmd_fg))
+            rfg = subprocess.run(cmd_fg, capture_output=True, text=True, timeout=180)
+            if rfg.returncode != 0 or not os.path.exists(fg_path):
+                rb("[render_binary] [tc] fg_noflip FAILED")
+                rb((rfg.stderr or "")[-2000:])
+                timed_captions_enabled = False
+                tc_items = []
+            else:
+                rb("[render_binary] [tc] fg_noflip OK")
+
+        if timed_captions_enabled:
+            rb("[render_binary] [tc] Scanning FULL fg_noflip with EAST...")
+            net = cv2.dnn.readNet(model_path)
+
+            cap_fg = cv2.VideoCapture(fg_path)
+            if not cap_fg.isOpened():
+                rb("[render_binary] [tc] ERROR open fg_noflip")
+                timed_captions_enabled = False
+                tc_items = []
+            else:
+                fg_fps = cap_fg.get(cv2.CAP_PROP_FPS) or 30.0
+                fgW = int(cap_fg.get(cv2.CAP_PROP_FRAME_WIDTH))
+                fgH = int(cap_fg.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                rb(f"[render_binary] [tc] fg dims={fgW}x{fgH} fps={fg_fps:.2f}")
+
+                global_rect = None
+                frame_idx = 0
+                last_print = 0
+
+                # stride leve pra performance, mas ainda “vídeo inteiro”
+                stride = int(os.environ.get("TC_STRIDE", "2"))
+                stride = max(1, stride)
+
+                while True:
+                    ok, frame = cap_fg.read()
+                    if not ok:
+                        break
+
+                    if frame_idx % stride == 0:
+                        boxes = _east_filter_ignore_top(_east_detect_text_boxes(frame, net), fgH, EAST_IGNORE_TOP)
+                        if boxes:
+                            if global_rect is None:
+                                global_rect = (
+                                    min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                    max(b[2] for b in boxes), max(b[3] for b in boxes),
+                                )
+                            else:
+                                for b in boxes:
+                                    inter = _intersection_area(global_rect, b)
+                                    if _rect_area(b) > 0 and (inter / _rect_area(b)) < 0.5:
+                                        global_rect = _expand_rect(global_rect, b)
+
+                    frame_idx += 1
+                    if frame_idx - last_print >= 150:
+                        last_print = frame_idx
+                        rb(f"[render_binary] [tc] scan progress frame={frame_idx}")
+
+                cap_fg.release()
+
+                if global_rect is None:
+                    rb("[render_binary] [tc] NO BOX FOUND -> disable timed overlay")
+                    timed_captions_enabled = False
+                    tc_items = []
+                else:
+                    rb(f"[render_binary] [tc] raw global_rect={global_rect}")
+
+                    global_rect = _apply_padding(global_rect, fgW, fgH)
+                    global_rect = _shrink_height(global_rect, TC_HEIGHT_SHRINK_RATIO, fgH)
+                    gx1, gy1, gx2, gy2 = global_rect
+
+                    rb(f"[render_binary] [tc] padded+shrink rect={global_rect}")
+
+                    # map pre-hflip -> post-hflip
+                    hx1 = fgW - gx2
+                    hx2 = fgW - gx1
+
+                    tc_box_canvas = (
+                        x0j + hx1,
+                        y0j + gy1,
+                        x0j + hx2,
+                        y0j + gy2,
+                    )
+                    rb(f"[render_binary] [tc] tc_box_canvas={tc_box_canvas}")
+
+        # ======================================================
+        # ffmpeg render original (sem timed)
+        # ======================================================
         fc = ""
-        
-        # 1) Corta primeiro pelo bbox (isso garante que BG e FG partem do mesmo framing)
-        fc += (
-            f"[0:v]"
-            f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
-            f"setsar=1"
-            f"[vcrop];"
-        )
-        
-        # 2) Duplica o crop pra virar BG e FG
+        fc += (f"[0:v]crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},setsar=1[vcrop];")
         fc += f"[vcrop]split=2[vbgsrc][vfgsrc];"
-        
-        # 3) BG: pega o crop, aumenta pra preencher o canvas (fill) e recorta pro 9:16 + blur
         fc += (
             f"[vbgsrc]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
@@ -1010,8 +1065,6 @@ def render_binary():
             f"boxblur=luma_radius=10:luma_power=1:chroma_radius=10:chroma_power=1"
             f"[bg];"
         )
-        
-        # 4) FG: pega o MESMO crop e faz fit (mantém seu comportamento)
         fc += (
             f"[vfgsrc]"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
@@ -1019,11 +1072,8 @@ def render_binary():
             f"setsar=1"
             f"[fg];"
         )
-        
-        # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
-        
-        # 6) Drawtext top (stroke 4px)
+
         v_in = "v0"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
@@ -1035,8 +1085,7 @@ def render_binary():
                 f"[{v_out}];"
             )
             v_in = v_out
-        
-        # 7) CTA + noise + fps -> vout
+
         cta_esc = ff_escape_text(cta_text)
         fc += (
             f"[{v_in}]"
@@ -1048,8 +1097,7 @@ def render_binary():
             f"fps=30[vout]"
         )
 
-
-        app.logger.info("[render_binary] running ffmpeg (new motor)")
+        rb("[render_binary] running ffmpeg base render")
         cmd = [
             "ffmpeg", "-y",
             "-ss", "0.35",
@@ -1065,108 +1113,60 @@ def render_binary():
             "-aspect", "9:16",
             out_path
         ]
-
-        app.logger.error("[render_binary] FILTER_COMPLEX ↓↓↓\n" + fc)
-        app.logger.error("[render_binary] CMD ↓↓↓\n" + " ".join(cmd))
-
+        rb("[render_binary] CMD=" + " ".join(cmd))
 
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
 
-        # fallback 1: se falhar, tenta SEM -ss
         if r.returncode != 0 or not os.path.exists(out_path):
-            if "-ss" in cmd:
-                cmd2 = cmd.copy()
-                i = cmd2.index("-ss")
-                del cmd2[i:i+2]
-                r = subprocess.run(cmd2, capture_output=True, text=True, timeout=280)
+            rb("[render_binary] ffmpeg base FAILED")
+            rb((r.stderr or "")[-4000:])
+            return jsonify({"error": "ffmpeg failed", "stderr_tail": (r.stderr or "")[-2000:]}), 500
 
-        # fallback 2: se falhar, tenta SEM áudio
-        if r.returncode != 0 or not os.path.exists(out_path):
-            cmd3 = []
-            skip_next = False
-            for j, tok in enumerate(cmd):
-                if skip_next:
-                    skip_next = False
-                    continue
-                if tok in ("-af",):
-                    skip_next = True
-                    continue
-                if tok == "-map" and j + 1 < len(cmd) and cmd[j+1] == "0:a?":
-                    skip_next = True
-                    continue
-                if tok in ("-c:a", "-b:a"):
-                    skip_next = True
-                    continue
-                cmd3.append(tok)
-            if "-an" not in cmd3:
-                cmd3.insert(cmd3.index("-c:v"), "-an")
-                
-            r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
+        rb("[render_binary] ffmpeg base OK")
 
-        if r.returncode != 0 or not os.path.exists(out_path):
-            app.logger.error("[render_binary] ffmpeg FAILED")
-            app.logger.error((r.stderr or "")[-8000:])
-            return jsonify({
-                "error": "ffmpeg failed",
-                "stderr_tail": (r.stderr or "")[-2000:]
-            }), 500
-
-        # ---- Timed captions overlay pass (validated pipeline) ----
-        # Only if user provided timed_captions and we successfully detected a box.
+        # ======================================================
+        # Timed overlay pass (white + timed captions)
+        # ======================================================
         if timed_captions_enabled and tc_box_canvas is not None and tc_items:
-            try:
-                overlay_noaudio = os.path.join(tmp_dir, f"{vid_id}_tc_noaudio.mp4")
-                final_tc = os.path.join(tmp_dir, f"{vid_id}F_tc.mp4")
+            rb("[render_binary] [tc] APPLY OVERLAY PASS")
+            overlay_noaudio = os.path.join(tmp_dir, f"{vid_id}__tc_noaudio.mp4")
+            overlay_final = os.path.join(tmp_dir, f"{vid_id}__tc_final.mp4")
 
-                apply_timed_captions_overlay(out_path, overlay_noaudio, tc_box_canvas, tc_items, fontfile)
+            apply_timed_captions_overlay(out_path, overlay_noaudio, tc_box_canvas, tc_items, fontfile)
 
-                # Mux audio from the already-rendered video into the overlay video.
-                mux_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", overlay_noaudio,
-                    "-i", out_path,
-                    "-map", "0:v:0",
-                    "-map", "1:a?",
-                    "-c:v", "copy",
-                    "-c:a", "copy",
-                    "-movflags", "+faststart",
-                    final_tc,
-                ]
-                mr = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=280)
-                if mr.returncode != 0 or not os.path.exists(final_tc):
-                    # Fallback: if video codec can't be copied (e.g. mp4v), re-encode.
-                    mux_cmd2 = [
-                        "ffmpeg", "-y",
-                        "-i", overlay_noaudio,
-                        "-i", out_path,
-                        "-map", "0:v:0",
-                        "-map", "1:a?",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                        "-pix_fmt", "yuv420p",
-                        "-c:a", "copy",
-                        "-movflags", "+faststart",
-                        final_tc,
-                    ]
-                    mr = subprocess.run(mux_cmd2, capture_output=True, text=True, timeout=280)
+            rb("[render_binary] [tc] mux audio back")
+            cmd_mux = [
+                "ffmpeg", "-y",
+                "-i", overlay_noaudio,
+                "-i", out_path,
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                overlay_final
+            ]
+            rb("[render_binary] [tc] CMD mux=" + " ".join(cmd_mux))
+            rmux = subprocess.run(cmd_mux, capture_output=True, text=True, timeout=280)
+            if rmux.returncode != 0 or not os.path.exists(overlay_final):
+                rb("[render_binary] [tc] mux FAILED")
+                rb((rmux.stderr or "")[-4000:])
+            else:
+                rb("[render_binary] [tc] overlay OK -> replacing out_path")
+                out_path = overlay_final
+        else:
+            rb(f\"[render_binary] [tc] SKIP overlay | enabled={timed_captions_enabled} box={tc_box_canvas is not None} items={len(tc_items)}\")
 
-                if mr.returncode == 0 and os.path.exists(final_tc):
-                    out_path = final_tc
-            except Exception as e:
-                app.logger.error(f"[render_binary] timed_captions overlay failed: {e}")
-
-        app.logger.info("[render_binary] DONE, sending file")
-        return send_file(
-            out_path,
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name=f"{vid_id}F.mp4"
-        )
+        rb("[render_binary] DONE, sending file")
+        return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name=f\"{vid_id}F.mp4\")
 
     except subprocess.TimeoutExpired:
-        app.logger.error("[render_binary] ffmpeg TIMEOUT")
+        rb("[render_binary] ERROR ffmpeg timeout")
         return jsonify({"error": "ffmpeg timeout"}), 504
 
     except Exception as e:
+        rb(f\"[render_binary] EXCEPTION: {e}\")
         app.logger.exception("[render_binary] EXCEPTION")
         return jsonify({"error": "render exception", "details": str(e)[:2000]}), 500
 
