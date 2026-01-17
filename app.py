@@ -84,7 +84,7 @@ def still():
 
 
 #NEW:
-def detect_burned_sub_band(img_bgr: np.ndarray):
+def detect_burned_sub_band(img_bgr):
     """
     Return (y1, y2) of subtitle band in source coords, or None.
     Heurística: procura faixa horizontal com muitos edges no terço inferior.
