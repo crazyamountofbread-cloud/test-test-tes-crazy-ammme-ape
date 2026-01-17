@@ -11,7 +11,6 @@ import json
 import random
 
 app = Flask(__name__)
-
 @app.get("/")
 def root():
     return jsonify({"ok": True})
@@ -82,121 +81,12 @@ def still():
 # ======================================================
 # Helpers (render)
 # ======================================================
-
-import numpy as np
-import cv2
-
-
-def smooth1d(x: np.ndarray, k: int) -> np.ndarray:
-    k = max(5, k | 1)
-    kernel = np.ones(k, dtype=np.float32) / k
-    return np.convolve(x, kernel, mode="same")
-
-
-def largest_contiguous_segment(idx: np.ndarray):
-    if idx.size == 0:
-        return None
-    d = np.diff(idx)
-    breaks = np.where(d > 1)[0]
-    starts = np.r_[idx[0], idx[breaks + 1]]
-    ends   = np.r_[idx[breaks], idx[-1]]
-    lengths = ends - starts + 1
-    j = int(np.argmax(lengths))
-    return int(starts[j]), int(ends[j])
-
-
-#NEW:
-def detect_burned_sub_band(img_bgr):
-    """
-    Retorna (y1, y2) da faixa da legenda burned-in (com padding), ou None.
-    Funciona bem com 1 ou 2 linhas.
-    """
-    h, w = img_bgr.shape[:2]
-
-    # procura no terço inferior (onde legenda normalmente fica)
-    y_start = int(h * 0.50)
-    roi = img_bgr[y_start:, :]
-    if roi.size == 0:
-        return None
-
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    H = hsv[..., 0].astype(np.int16)
-    S = hsv[..., 1].astype(np.int16)
-    V = hsv[..., 2].astype(np.int16)
-
-    # branco + amarelo (comum em subtitle)
-    mask_white  = (V > 210) & (S < 95)
-    mask_yellow = (H >= 12) & (H <= 55) & (S > 60) & (V > 110)
-    mask = (mask_white | mask_yellow).astype(np.uint8) * 255
-
-    # morfologia leve
-    k = max(3, (min(h, w) // 260) | 1)
-    kernel = np.ones((k, k), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
-
-    # densidade por linha
-    row = (mask.mean(axis=1) / 255.0)
-    row_s = smooth1d(row, k=max(9, (roi.shape[0] // 45) | 1))
-
-    peak = float(row_s.max())
-    if peak < 0.008:
-        return None
-
-    thr = max(0.010, peak * 0.55)
-    idx = np.where(row_s >= thr)[0]
-    if idx.size == 0:
-        return None
-
-    seg = largest_contiguous_segment(idx)
-    if seg is None:
-        return None
-
-    y1, y2 = int(seg[0]), int(seg[1])
-
-    # --- suporte a 2 linhas: junta qualquer outro segmento “perto” ---
-    d = np.diff(idx)
-    breaks = np.where(d > 1)[0]
-    starts = np.r_[idx[0], idx[breaks + 1]]
-    ends   = np.r_[idx[breaks], idx[-1]]
-    segs = [(int(s), int(e)) for s, e in zip(starts, ends)]
-
-    MERGE_GAP = max(10, roi.shape[0] // 26)
-    changed = True
-    while changed:
-        changed = False
-        for s, e in segs:
-            if e < y1 - MERGE_GAP or s > y2 + MERGE_GAP:
-                continue
-            ny1 = min(y1, s)
-            ny2 = max(y2, e)
-            if ny1 != y1 or ny2 != y2:
-                y1, y2 = ny1, ny2
-                changed = True
-
-    # rejeita faixa absurda
-    if (y2 - y1) > int(roi.shape[0] * 0.55):
-        return None
-
-    # padding (pra pegar 2 linhas + outline)
-    pad_up = max(12, h // 60)
-    pad_dn = max(14, h // 55)
-
-    y1g = max(0, y_start + y1 - pad_up)
-    y2g = min(h - 1, y_start + y2 + pad_dn)
-
-    # mínimo de altura
-    if (y2g - y1g) < max(40, h // 35):
-        return None
-
-    return int(y1g), int(y2g)
-
-
 def sanitize_caption(s: str) -> str:
     s = s.replace("\r", "").lstrip("\ufeff")
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("'", "’")
     s = s.replace('"', "”")
+    
 
     out = []
     for ch in s:
@@ -243,7 +133,7 @@ def ff_escape_text(s: str) -> str:
 from dataclasses import dataclass
 from PIL import ImageFont
 
-
+# ---- Font helpers (Pillow on some Linux builds can't load variable fonts) ----
 def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
     """Return first font path that exists and Pillow can load."""
     for p in candidates:
@@ -262,6 +152,8 @@ def resolve_font_path(candidates: list[str], test_size: int = 48) -> str:
         "No usable TTF font found. Provide a static .ttf via FONTFILE env or include one in ./fonts."
     )
 
+import numpy as np
+import cv2
 
 @dataclass
 class BBox:
@@ -269,7 +161,6 @@ class BBox:
     y: int
     w: int
     h: int
-
 
 def ffprobe_dims(path: str):
     cmd = [
@@ -283,12 +174,10 @@ def ffprobe_dims(path: str):
     st = data["streams"][0]
     return int(st["width"]), int(st["height"])
 
-
 def extract_frame(in_video: str, out_png: str, t: float) -> bool:
     cmd = ["ffmpeg", "-y", "-ss", str(t), "-i", in_video, "-vframes", "1", "-q:v", "2", out_png]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0 and os.path.exists(out_png)
-
 
 def detect_bg_color(img_bgr: np.ndarray):
     h, w = img_bgr.shape[:2]
@@ -303,6 +192,21 @@ def detect_bg_color(img_bgr: np.ndarray):
     m = float(np.mean(luma))
     return (255,255,255) if m >= 128 else (0,0,0)
 
+def smooth1d(x: np.ndarray, k: int) -> np.ndarray:
+    k = max(5, k | 1)
+    kernel = np.ones(k, dtype=np.float32) / k
+    return np.convolve(x, kernel, mode="same")
+
+def largest_contiguous_segment(idx: np.ndarray):
+    if idx.size == 0:
+        return None
+    d = np.diff(idx)
+    breaks = np.where(d > 1)[0]
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends   = np.r_[idx[breaks], idx[-1]]
+    lengths = ends - starts + 1
+    j = int(np.argmax(lengths))
+    return int(starts[j]), int(ends[j])
 
 def build_content_mask(img_bgr: np.ndarray, tol: int) -> np.ndarray:
     bg = np.array(detect_bg_color(img_bgr), dtype=np.int16)
@@ -317,7 +221,6 @@ def build_content_mask(img_bgr: np.ndarray, tol: int) -> np.ndarray:
     content = cv2.morphologyEx(content, cv2.MORPH_CLOSE, kernel, iterations=2)
     return content
 
-
 def find_bbox_ignore_overlay(img_bgr: np.ndarray, tol: int = 28, row_thresh: float = 0.08):
     # y_only: corta só topo/baixo, mantém largura total
     h, w = img_bgr.shape[:2]
@@ -331,7 +234,6 @@ def find_bbox_ignore_overlay(img_bgr: np.ndarray, tol: int = 28, row_thresh: flo
     y1, y2 = seg
     return BBox(x=0, y=y1, w=w, h=(y2 - y1 + 1))
 
-
 def median_bbox(bboxes):
     xs = np.array([b.x for b in bboxes], dtype=np.int32)
     ys = np.array([b.y for b in bboxes], dtype=np.int32)
@@ -339,10 +241,8 @@ def median_bbox(bboxes):
     hs = np.array([b.h for b in bboxes], dtype=np.int32)
     return BBox(int(np.median(xs)), int(np.median(ys)), int(np.median(ws)), int(np.median(hs)))
 
-
 def escape_filter_path(p: str) -> str:
     return p.replace("\\", "\\\\").replace(":", r"\:").replace(",", r"\,")
-
 
 @dataclass
 class FitResult:
@@ -351,7 +251,6 @@ class FitResult:
     text_h: int
     line_h: int
     line_ws: list
-
 
 def wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int):
     words = text.strip().split()
@@ -387,7 +286,6 @@ def wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int):
             fixed.append(buf)
     return fixed
 
-
 def measure_lines(lines, font: ImageFont.FreeTypeFont, line_spacing: float):
     b = font.getbbox("Ag")
     base_line_h = (b[3] - b[1])
@@ -398,7 +296,6 @@ def measure_lines(lines, font: ImageFont.FreeTypeFont, line_spacing: float):
         widths.append(bb[2] - bb[0])
     text_h = line_h * len(lines) - (line_h - base_line_h)
     return text_h, line_h, widths
-
 
 def fit_text_top(text: str, font_path: str, max_w: int, max_h: int,
                  max_font: int = 96, min_font: int = 34,
@@ -501,34 +398,6 @@ def render_binary():
         bbox.w = max(1, min(bbox.w, src_w - bbox.x))
         bbox.h = max(1, min(bbox.h, src_h - bbox.y))
 
-        # ======================================================
-        # Detect subtitle band on CROPPED (bbox) -> returns coords inside CROPPED
-        # ======================================================
-        sub_bands = []
-        for fp in frames:
-            img = cv2.imread(fp, cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-
-            h0, w0 = img.shape[:2]
-            x1 = max(0, min(bbox.x, w0 - 1))
-            y1 = max(0, min(bbox.y, h0 - 1))
-            x2 = max(x1 + 1, min(bbox.x + bbox.w, w0))
-            y2 = max(y1 + 1, min(bbox.y + bbox.h, h0))
-            img_crop = img[y1:y2, x1:x2]
-
-            band = detect_burned_sub_band(img_crop)  # returns y in CROPPED coords
-            if band:
-                sub_bands.append(band)
-
-        sub_y1 = sub_y2 = None
-        # IMPORTANT: consider 1+ frame (not 2+) to avoid false-negative
-        if len(sub_bands) >= 1:
-            sub_y1 = int(np.median([b[0] for b in sub_bands]))  # CROPPED coords
-            sub_y2 = int(np.median([b[1] for b in sub_bands]))  # CROPPED coords
-
-        has_sub = (sub_y1 is not None and sub_y2 is not None and (sub_y2 - sub_y1) >= 35)
-
         # --- fixed 9:16 canvas ---
         CANVAS_W, CANVAS_H = 720, 1280
 
@@ -538,10 +407,11 @@ def render_binary():
         out_ch = int(round(bbox.h * scale))
         x0 = (CANVAS_W - out_cw) // 2
         y0 = (CANVAS_H - out_ch) // 2
-
-        # >>> trim 10px each side on the FINAL foreground (in pixels)
+        
+        # >>> ADD: trim 10px each side on the FINAL foreground (in pixels)
         FG_TRIM_X = 10
         out_cw_fg = max(2, out_cw - (FG_TRIM_X * 2))
+
 
         # --- TOP TEXT auto-fit, bottom aligned to (y0 - 5) ---
         top_gap = 15
@@ -552,44 +422,49 @@ def render_binary():
             fontfile,
             max_w=top_box_w,
             max_h=space_above,
-            max_font=58,       # menor
-            min_font=28,       # menor
-            line_spacing=1.06, # menos distancia entre linhas
+            max_font=58,      # menor
+            min_font=28,      # menor
+            line_spacing=1.06,# menos distancia entre linhas
             max_lines=3,
         )
 
+        
         TOP_MARGIN = 28  # espaço obrigatório no topo
         y_block = (y0 - top_gap) - fit.text_h
         if y_block < TOP_MARGIN:
             y_block = TOP_MARGIN
+
 
         line_xs = []
         for lw in fit.line_ws:
             line_xs.append(max(0, (CANVAS_W - lw) // 2))
         line_ys = [y_block + i * fit.line_h for i in range(len(fit.lines))]
 
-        # --- CTA ---
+        # --- CTA (NOW: over the video, near the bottom of the foreground) ---
         cta_text = "Siga @SuperEmAlta"
         cta_font_size = 48
         font_obj = ImageFont.truetype(fontfile, cta_font_size)
         bb = font_obj.getbbox(cta_text)
         cta_w = bb[2] - bb[0]
         cta_h = bb[3] - bb[1]
-
+        
         CTA_PAD_X = 28
         CTA_PAD_Y = 14
         CTA_BOTTOM_PAD = 18  # distance from the bottom edge of the FG video
-
+        
+        # position relative to the foreground (use non-jittered y0 here; jitter is applied in overlay anyway)
         y_cta = y0 + out_ch - cta_h - CTA_BOTTOM_PAD
         if y_cta < 0:
             y_cta = 0
-
+        
         x_cta = max(0, (CANVAS_W - cta_w) // 2)
-
+        
+        # CTA background box (black 50%)
         box_w = cta_w + (CTA_PAD_X * 2)
         box_h = cta_h + (CTA_PAD_Y * 2)
         x_box = max(0, (CANVAS_W - box_w) // 2)
         y_box = max(0, y_cta - CTA_PAD_Y)
+
 
         # --- ffmpeg filter_complex ---
         font_ff = escape_filter_path(fontfile)
@@ -616,22 +491,19 @@ def render_binary():
 
         # Background + Foreground: ambos derivados do MESMO crop (bbox)
         fc = ""
-
-        # 1) Corta primeiro pelo bbox
+        
+        # 1) Corta primeiro pelo bbox (isso garante que BG e FG partem do mesmo framing)
         fc += (
             f"[0:v]"
             f"crop={bbox.w}:{bbox.h}:{bbox.x}:{bbox.y},"
             f"setsar=1"
             f"[vcrop];"
         )
-
-        # 2) split: ONLY 3 outputs if we will actually use vsubsrc
-        if has_sub:
-            fc += f"[vcrop]split=3[vbgsrc][vfgsrc][vsubsrc];"
-        else:
-            fc += f"[vcrop]split=2[vbgsrc][vfgsrc];"
-
-        # 3) BG
+        
+        # 2) Duplica o crop pra virar BG e FG
+        fc += f"[vcrop]split=2[vbgsrc][vfgsrc];"
+        
+        # 3) BG: pega o crop, aumenta pra preencher o canvas (fill) e recorta pro 9:16 + blur
         fc += (
             f"[vbgsrc]"
             f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
@@ -639,8 +511,8 @@ def render_binary():
             f"boxblur=luma_radius=10:luma_power=1:chroma_radius=10:chroma_power=1"
             f"[bg];"
         )
-
-        # 4) FG (mirrored)
+        
+        # 4) FG: pega o MESMO crop e faz fit (mantém seu comportamento)
         fc += (
             f"[vfgsrc]"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
@@ -648,38 +520,12 @@ def render_binary():
             f"setsar=1"
             f"[fg];"
         )
-
-        # 5) Overlay FG on BG
+        
+        # 5) Overlay do FG por cima do BG
         fc += f"[bg][fg]overlay={x0j}:{y0j}[v0];"
-
-        # 5.5) Subtitle band overlay (ONLY if detected) - from vcrop, same scale as FG, NOT mirrored, same position
-        v_start = "v0"
-        if has_sub:
-            # extra padding on top/bottom to cover 2 lines cleanly
-            PAD_UP = 18
-            PAD_DN = 22
-
-            sub_y1p = max(0, sub_y1 - PAD_UP)
-            sub_y2p = min(bbox.h - 1, sub_y2 + PAD_DN)
-
-            sub_h_src = max(2, sub_y2p - sub_y1p)
-            sub_h_out = int(round(sub_h_src * scale))                 # mesma escala do FG
-            y_sub_canvas = int(round(y0j + (sub_y1p * scale)))         # posição REAL no canvas (com padding)
-            x_sub_canvas = x0j                                         # mesmo x do FG
-
-            fc += (
-                f"[vsubsrc]"
-                f"crop={bbox.w}:{sub_h_src}:0:{sub_y1p},"
-                f"scale={out_cw}:{sub_h_out}:flags=lanczos,"
-                f"crop={out_cw_fg}:{sub_h_out}:{FG_TRIM_X}:0,"
-                f"setsar=1"
-                f"[sub];"
-            )
-            fc += f"[v0][sub]overlay={x_sub_canvas}:{y_sub_canvas}[v0s];"
-            v_start = "v0s"
-
-        # 6) Drawtext
-        v_in = v_start
+        
+        # 6) Drawtext top (stroke 4px)
+        v_in = "v0"
         for i, ln in enumerate(fit.lines):
             ln_esc = ff_escape_text(ln)
             v_out = f"vt{i}"
@@ -690,7 +536,7 @@ def render_binary():
                 f"[{v_out}];"
             )
             v_in = v_out
-
+        
         # 7) CTA + noise + fps -> vout
         cta_esc = ff_escape_text(cta_text)
         fc += (
@@ -702,6 +548,7 @@ def render_binary():
             f"noise=alls={noise_strength}:allf=t,"
             f"fps=30[vout]"
         )
+
 
         app.logger.info("[render_binary] running ffmpeg (new motor)")
         cmd = [
@@ -722,6 +569,7 @@ def render_binary():
 
         app.logger.error("[render_binary] FILTER_COMPLEX ↓↓↓\n" + fc)
         app.logger.error("[render_binary] CMD ↓↓↓\n" + " ".join(cmd))
+
 
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
 
@@ -753,7 +601,7 @@ def render_binary():
                 cmd3.append(tok)
             if "-an" not in cmd3:
                 cmd3.insert(cmd3.index("-c:v"), "-an")
-
+                
             r = subprocess.run(cmd3, capture_output=True, text=True, timeout=280)
 
         if r.returncode != 0 or not os.path.exists(out_path):
