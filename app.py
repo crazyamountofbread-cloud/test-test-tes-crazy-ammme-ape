@@ -516,7 +516,7 @@ def render_binary():
         fc += (
             f"[vfgsrc]"
             f"scale={out_cw}:{out_ch}:flags=lanczos,"
-            f"crop={out_cw_fg}:{out_ch}:{FG_TRIM_X}:0,"
+            f"hflip,"
             f"setsar=1"
             f"[fg];"
         )
